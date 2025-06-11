@@ -60,21 +60,139 @@ fn process_audio_file() -> Result<(), String> {
         }
     };
 
-    // --- 2. Get the minimum silence length threshold from the user ---
-    let silence_threshold_seconds: f64 = loop {
-        print!("Enter the minimum silence length in seconds (e.g., 2.0): ");
-        io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
-        let mut threshold_str = String::new();
-        io::stdin().read_line(&mut threshold_str).map_err(|e| format!("Failed to read line: {}", e))?;
+    let mut silence_threshold_seconds: f64;
+    let mut noise_threshold_db: f64;
+    let mut split_points: Vec<f64> = Vec::new(); // Initialize here, will be updated in the loop
 
-        // Parse the input string to a floating-point number and validate it.
-        match threshold_str.trim().parse::<f64>() {
-            Ok(t) if t > 0.0 => break t, // Accept only positive numbers.
-            _ => println!("Error: Invalid threshold. Please enter a positive number."),
+    // Loop for silence detection and re-analysis
+    loop {
+        // --- 2. Get the minimum silence length threshold from the user ---
+        silence_threshold_seconds = loop {
+            print!("Enter the minimum silence length in seconds (e.g., 2.0): ");
+            io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
+            let mut threshold_str = String::new();
+            io::stdin().read_line(&mut threshold_str).map_err(|e| format!("Failed to read line: {}", e))?;
+
+            // Parse the input string to a floating-point number and validate it.
+            match threshold_str.trim().parse::<f64>() {
+                Ok(t) if t > 0.0 => break t, // Accept only positive numbers.
+                _ => println!("Error: Invalid threshold. Please enter a positive number."),
+            }
+        };
+
+        // --- 3. Get the noise threshold (n value) from the user ---
+        // This allows the user to fine-tune what FFmpeg considers "silence".
+        // A less negative value (e.g., -30dB) means FFmpeg will be more lenient,
+        // considering sounds up to that level as part of a silence.
+        noise_threshold_db = loop {
+            print!("Enter the noise threshold in dB (e.g., -40.0). Suggestion: -40.0dB. Less negative values detect more silence: ");
+            io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
+            let mut noise_str = String::new();
+            io::stdin().read_line(&mut noise_str).map_err(|e| format!("Failed to read line: {}", e))?;
+
+            // Parse the input string to a floating-point number.
+            // It's common for this to be a negative number, so we only validate it's a number.
+            match noise_str.trim().parse::<f64>() {
+                Ok(n) => break n,
+                _ => println!("Error: Invalid noise threshold. Please enter a number (e.g., -40.0)."),
+            }
+        };
+
+        println!("\nStatus: Detecting silences in '{}' with threshold {:.2}s and noise {}dB...",
+                 input_audio_path.display(), silence_threshold_seconds, noise_threshold_db);
+        println!("(This might take a while for long audio files)");
+
+        // --- 5. Detect silences using FFmpeg's 'silencedetect' filter ---
+        let output = Command::new("ffmpeg")
+            .arg("-i")
+            .arg(&input_audio_path)
+            .arg("-hide_banner") // Hide FFmpeg version and build config info
+            .arg("-loglevel")   // Set logging level for detailed output
+            .arg("debug")       // Use 'debug' to see full silencedetect output
+            .arg("-af")
+            .arg(format!("silencedetect=n={}dB:d={}", noise_threshold_db, silence_threshold_seconds))
+            .arg("-f")
+            .arg("null")
+            .arg("-")
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn ffmpeg. Please ensure FFmpeg is installed and in your PATH. Error: {}", e))?
+            .wait_with_output()
+            .map_err(|e| format!("Failed to wait for ffmpeg process: {}", e))?;
+
+        if !output.status.success() {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("FFmpeg exited with a non-zero status code during silence detection. Stderr:\n{}", stderr_str));
         }
-    };
 
-    // --- 3. Get the output path and file name prefix from the user ---
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+        let re_start = Regex::new(r"silence_start: (?P<start>\d+\.\d+)").unwrap();
+        let re_end = Regex::new(r"silence_end: (?P<end>\d+\.\d+) \| silence_duration: (?P<duration>\d+\.\d+)").unwrap();
+
+        let mut starts: Vec<f64> = Vec::new();
+        let mut detected_silences: Vec<Silence> = Vec::new();
+
+        // Iterate line by line to capture start and end points correctly
+        for line in stderr_str.lines() {
+            if let Some(cap) = re_start.captures(line) {
+                let start = cap["start"].parse::<f64>().map_err(|e| format!("Failed to parse silence start time: {}", e))?;
+                starts.push(start);
+            } else if let Some(cap) = re_end.captures(line) {
+                let end = cap["end"].parse::<f64>().map_err(|e| format!("Failed to parse silence end time: {}", e))?;
+                let duration = cap["duration"].parse::<f64>().map_err(|e| format!("Failed to parse silence duration: {}", e))?;
+
+                if let Some(start) = starts.pop() {
+                    detected_silences.push(Silence { start, end, duration });
+                } else {
+                    eprintln!("Warning: Found silence_end without a matching silence_start. End: {:.2}s, Duration: {:.2}s", end, duration);
+                }
+            }
+        }
+
+        // --- 6. Determine effective split points based on the user's threshold ---
+        split_points.clear(); // Clear previous split points for re-analysis
+        for silence in detected_silences { // Use the newly detected silences
+            if silence.duration >= silence_threshold_seconds {
+                // MODIFIED: Calculate the split point to be in the middle of the silence
+                let mid_silence_point = silence.start + (silence.duration / 2.0);
+                split_points.push(mid_silence_point);
+            }
+        }
+
+        if split_points.is_empty() {
+            println!("No silences detected longer than the specified threshold with current settings.");
+            // Ask user if they want to re-analyze or exit if no splits found
+            print!("Do you want to re-analyze with different settings? (y/n): ");
+            io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
+            let mut reanalyze_response = String::new();
+            io::stdin().read_line(&mut reanalyze_response).map_err(|e| format!("Failed to read line: {}", e))?;
+            if reanalyze_response.trim().eq_ignore_ascii_case("y") {
+                continue; // Restart the loop for new settings
+            } else {
+                return Ok(()); // Exit if user doesn't want to re-analyze and no splits found
+            }
+        }
+
+        println!("Status: Identified {} audio segments to be split.", split_points.len());
+
+        // --- Prompt for re-analysis or proceed ---
+        print!("Do you want to (r)e-analyze with different settings or (p)roceed to split? (r/p): ");
+        io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice).map_err(|e| format!("Failed to read line: {}", e))?;
+
+        match choice.trim().to_lowercase().as_str() {
+            "r" => continue, // Restart the loop for re-analysis
+            "p" => break,    // Break out of the analysis loop to proceed with splitting
+            _ => {
+                println!("Invalid choice. Please enter 'r' to re-analyze or 'p' to proceed. Re-analyzing by default...");
+                continue; // Default to re-analyze on invalid input
+            }
+        }
+    }
+
+    // --- 4. Get the output path and file name prefix from the user ---
     let output_prefix = loop {
         print!("Enter the output directory and file name prefix (e.g., output/part): ");
         io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
@@ -95,7 +213,6 @@ fn process_audio_file() -> Result<(), String> {
                 let mut create_dir_response = String::new();
                 io::stdin().read_line(&mut create_dir_response).map_err(|e| format!("Failed to read line: {}", e))?;
                 if create_dir_response.trim().eq_ignore_ascii_case("y") {
-                    // Attempt to create the directory and all its necessary parent directories.
                     std::fs::create_dir_all(output_dir.clone())
                         .map_err(|e| format!("Failed to create directory '{}': {}", output_dir.display(), e))?;
                     break prefix; // Directory created, so the prefix is valid.
@@ -107,67 +224,6 @@ fn process_audio_file() -> Result<(), String> {
             }
         }
     };
-
-    println!("\nStatus: Detecting silences in '{}'...", input_audio_path.display());
-    println!("(This might take a while for long audio files)");
-
-    // --- 4. Detect silences using FFmpeg's 'silencedetect' filter ---
-    // The silencedetect filter outputs detection information to stderr.
-    let output = Command::new("ffmpeg")
-        .arg("-i") // Input file
-        .arg(&input_audio_path)
-        .arg("-af") // Audio filtergraph
-        // silencedetect: n=-50dB (noise threshold - samples below this are considered silence),
-        // d=silence_threshold_seconds (minimum duration for a detected silence to be reported).
-        // A threshold of -50dB is common; you might adjust this if needed for very noisy/quiet audio.
-        .arg(format!("silencedetect=n=-50dB:d={}", silence_threshold_seconds))
-        .arg("-f") // Force format (null means no output file)
-        .arg("null")
-        .arg("-") // Send output to stdout (silencedetect logs to stderr)
-        .stderr(Stdio::piped()) // Capture stderr to parse silence detection logs.
-        .spawn() // Execute the command.
-        .map_err(|e| format!("Failed to spawn ffmpeg. Please ensure FFmpeg is installed and in your PATH. Error: {}", e))?
-        .wait_with_output() // Wait for FFmpeg to complete and capture its output.
-        .map_err(|e| format!("Failed to wait for ffmpeg process: {}", e))?;
-
-    // Check if FFmpeg command executed successfully.
-    if !output.status.success() {
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("FFmpeg exited with a non-zero status code. Stderr:\n{}", stderr_str));
-    }
-
-    // Parse FFmpeg's stderr output to extract silence information.
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-    // Regular expression to match lines containing silence_start, silence_end, and silence_duration.
-    let re = Regex::new(r"silence_start: (?P<start>\d+\.\d+) \| silence_end: (?P<end>\d+\.\d+) \| silence_duration: (?P<duration>\d+\.\d+)").unwrap();
-
-    let mut silences: Vec<Silence> = Vec::new();
-    // Iterate over all matches found by the regex.
-    for cap in re.captures_iter(&stderr_str) {
-        // Parse the captured strings into f64 (floating-point numbers).
-        let start = cap["start"].parse::<f64>().map_err(|e| format!("Failed to parse silence start time: {}", e))?;
-        let end = cap["end"].parse::<f64>().map_err(|e| format!("Failed to parse silence end time: {}", e))?;
-        let duration = cap["duration"].parse::<f64>().map_err(|e| format!("Failed to parse silence duration: {}", e))?;
-        silences.push(Silence { start, end, duration });
-    }
-
-    if silences.is_empty() {
-        println!("No silences detected longer than the threshold. No splits will be made.");
-        return Ok(());
-    }
-
-    println!("Status: Detected {} potential silence regions. Identifying final split points...", silences.len());
-
-    // --- 5. Determine effective split points based on the user's threshold ---
-    let mut split_points: Vec<f64> = Vec::new();
-
-    // Iterate through the detected silences and add those meeting the threshold
-    // as potential split points (the end of the silence marks the split).
-    for silence in silences {
-        if silence.duration >= silence_threshold_seconds {
-            split_points.push(silence.end);
-        }
-    }
 
     // Get the total duration of the input audio file using ffprobe.
     // This is crucial to ensure the last segment correctly goes to the very end of the file.
@@ -200,9 +256,8 @@ fn process_audio_file() -> Result<(), String> {
         split_points.push(total_duration);
     }
 
-    println!("Status: Identified {} audio segments to be split.", split_points.len());
 
-    // --- 6. Split audio using FFmpeg for each determined segment ---
+    // --- 7. Split audio using FFmpeg for each determined segment ---
     let mut current_segment_start_time = 0.0; // Start time for the first segment.
 
     // Get the file extension of the original audio for the output files.
@@ -254,4 +309,3 @@ fn process_audio_file() -> Result<(), String> {
 
     Ok(()) // Indicate success.
 }
-
