@@ -3,6 +3,7 @@ use std::io::{self, Write}; // For input/output operations (reading user input, 
 use std::process::{Command, Stdio}; // For running external commands (FFmpeg, FFprobe).
 use std::path::{Path, PathBuf}; // For working with file paths.
 use regex::Regex; // For parsing FFmpeg's silence detection output.
+use std::collections::HashSet; // Added for deduplication of file paths.
 
 // Define a struct to hold the details of a detected silence region.
 struct Silence {
@@ -72,17 +73,21 @@ fn main() {
 
             println!("Status: Scanning folder '{}' for audio files...", folder_path.display());
             let audio_extensions = ["mp3", "wav", "flac", "aac", "m4a", "ogg"]; // Common audio extensions
+            let mut unique_paths: HashSet<PathBuf> = HashSet::new(); // Use a HashSet for deduplication
+
             for entry in std::fs::read_dir(&folder_path).expect("Failed to read directory") {
                 let entry = entry.expect("Failed to read directory entry");
                 let path = entry.path();
                 if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                         if audio_extensions.contains(&ext.to_lowercase().as_str()) {
-                            input_paths.push(path);
+                            unique_paths.insert(path); // Insert into HashSet to ensure uniqueness
                         }
                     }
                 }
             }
+            // Convert the HashSet back to a Vec for sorting
+            input_paths = unique_paths.into_iter().collect();
             input_paths.sort_by(|a, b| {
                 a.file_name().cmp(&b.file_name()) // Sort alphabetically by filename
             });
@@ -126,103 +131,119 @@ fn main() {
             }
         };
 
-        // --- Parameters for analysis, prompted once for single file or entire folder batch ---
-        let silence_threshold_seconds: f64 = loop {
-            print!("Enter the minimum silence length in seconds (e.g., 2.0): ");
-            io::stdout().flush().unwrap();
-            let mut threshold_str = String::new();
-            io::stdin().read_line(&mut threshold_str).unwrap();
-            match threshold_str.trim().parse::<f64>() {
-                Ok(t) if t > 0.0 => break t,
-                _ => println!("Error: Invalid threshold. Please enter a positive number."),
-            }
-        };
-
-        let noise_threshold_db: f64 = loop {
-            print!("Enter the noise threshold in dB (e.g., -40.0). Suggestion: -40.0dB. Less negative values detect more silence: ");
-            io::stdout().flush().unwrap();
-            let mut noise_str = String::new();
-            io::stdin().read_line(&mut noise_str).unwrap();
-            match noise_str.trim().parse::<f64>() {
-                Ok(n) => break n,
-                _ => println!("Error: Invalid noise threshold. Please enter a number (e.g., -40.0)."),
-            }
-        };
-
-        // If processing a single file, we offer re-analysis; for folders, we assume batch processing.
+        let mut silence_threshold_seconds: f64;
+        let mut noise_threshold_db: f64;
         let mut proceed_with_splitting = false;
-        if process_type == "s" {
-            loop {
-                println!("\nStatus: Performing initial silence detection for '{}' with threshold {:.2}s and noise {}dB...",
-                         input_paths[0].display(), silence_threshold_seconds, noise_threshold_db);
-                println!("(This might take a while for long audio files)");
 
-                let (detected_silences_for_single_file, total_duration_for_single_file) =
-                    match detect_silences_and_get_total_duration(&input_paths[0], silence_threshold_seconds, noise_threshold_db) {
-                        Ok((silences, duration)) => (silences, duration),
-                        Err(e) => {
-                            eprintln!("An error occurred during initial detection: {}", e);
-                            // For a single file, if detection fails, allow re-analysis or exit.
-                            print!("Do you want to re-analyze this file with different settings? (y/n): ");
-                            io::stdout().flush().unwrap();
-                            let mut reanalyze_response = String::new();
-                            io::stdin().read_line(&mut reanalyze_response).unwrap();
-                            if reanalyze_response.trim().eq_ignore_ascii_case("y") {
-                                continue; // Restart the loop for new settings
-                            } else {
-                                // User chooses not to re-analyze, skip this file entirely.
-                                // We'll set proceed_with_splitting to false and break out.
-                                println!("Skipping splitting for '{}' due to detection error.", input_paths[0].display());
-                                break;
+        // --- Analysis loop for both single file and folder batch ---
+        loop {
+            // Parameters for analysis, prompted once per analysis cycle
+            silence_threshold_seconds = loop {
+                print!("Enter the minimum silence length in seconds (e.g., 2.0): ");
+                io::stdout().flush().unwrap();
+                let mut threshold_str = String::new();
+                io::stdin().read_line(&mut threshold_str).unwrap();
+                match threshold_str.trim().parse::<f64>() {
+                    Ok(t) if t > 0.0 => break t,
+                    _ => println!("Error: Invalid threshold. Please enter a positive number."),
+                }
+            };
+
+            noise_threshold_db = loop {
+                print!("Enter the noise threshold in dB (e.g., -40.0). Suggestion: -40.0dB. Less negative values detect more silence: ");
+                io::stdout().flush().unwrap();
+                let mut noise_str = String::new();
+                io::stdin().read_line(&mut noise_str).unwrap();
+                match noise_str.trim().parse::<f64>() {
+                    Ok(n) => break n,
+                    _ => println!("Error: Invalid noise threshold. Please enter a number (e.g., -40.0)."),
+                }
+            };
+
+            let mut total_segments_identified = 0;
+            let mut files_with_segments = 0;
+
+            println!("\nStatus: Performing initial silence detection across {} file(s) with threshold {:.2}s and noise {}dB...",
+                     input_paths.len(), silence_threshold_seconds, noise_threshold_db);
+            println!("(This might take a while for long audio files)");
+
+            // Perform dry run analysis for all files to get a summary
+            for audio_file_path in &input_paths {
+                print!("  Analyzing '{}'...", audio_file_path.display());
+                io::stdout().flush().unwrap();
+
+                match detect_silences_and_get_total_duration(audio_file_path, silence_threshold_seconds, noise_threshold_db) {
+                    Ok((detected_silences, total_duration)) => {
+                        let mut current_file_split_points: Vec<f64> = Vec::new();
+                        for silence in detected_silences {
+                            if silence.duration >= silence_threshold_seconds {
+                                current_file_split_points.push(silence.start + (silence.duration / 2.0));
                             }
                         }
-                    };
+                        // Ensure the last segment is counted
+                        if current_file_split_points.is_empty() || current_file_split_points.last().map_or(false, |&last_split| last_split < total_duration - 0.01) {
+                            current_file_split_points.push(total_duration);
+                        }
 
-                let mut temp_split_points: Vec<f64> = Vec::new();
-                for silence in detected_silences_for_single_file {
-                    if silence.duration >= silence_threshold_seconds {
-                        temp_split_points.push(silence.start + (silence.duration / 2.0));
+                        if !current_file_split_points.is_empty() {
+                            total_segments_identified += current_file_split_points.len();
+                            files_with_segments += 1;
+                        }
+                        println!(" Identified {} segments.", current_file_split_points.len());
+                    },
+                    Err(e) => {
+                        eprintln!("\n  Error analyzing '{}': {}", audio_file_path.display(), e);
+                        println!("  (This file will be skipped if you choose to proceed with splitting.)");
                     }
                 }
+            }
 
-                // Ensure the last segment of the audio is always included for accurate point count
-                if temp_split_points.is_empty() || temp_split_points.last().map_or(false, |&last_split| last_split < total_duration_for_single_file - 0.01) {
-                    temp_split_points.push(total_duration_for_single_file);
+            if total_segments_identified == 0 {
+                println!("\nNo silences detected longer than the specified threshold across all files with current settings.");
+                print!("Do you want to re-analyze with different settings? (y/n): ");
+                io::stdout().flush().unwrap();
+                let mut reanalyze_response = String::new();
+                io::stdin().read_line(&mut reanalyze_response).unwrap();
+                if reanalyze_response.trim().eq_ignore_ascii_case("y") {
+                    continue; // Restart the analysis loop for new settings
+                } else {
+                    println!("Skipping audio splitting for the current selection.");
+                    proceed_with_splitting = false; // Ensure we don't proceed if user says no
+                    break; // Exit analysis loop
                 }
+            } else {
+                println!("\nSummary: Identified {} total audio segments across {} of {} file(s).",
+                         total_segments_identified, files_with_segments, input_paths.len());
 
-                println!("Status: Identified {} audio segments to be split for '{}'.", temp_split_points.len(), input_paths[0].display());
-
-                print!("Do you want to (r)e-analyze this file with different settings or (p)roceed to split? (r/p): ");
+                print!("Do you want to (r)e-analyze with different settings or (p)roceed to split all files? (r/p): ");
                 io::stdout().flush().unwrap();
                 let mut choice = String::new();
                 io::stdin().read_line(&mut choice).unwrap();
                 match choice.trim().to_lowercase().as_str() {
-                    "r" => continue,
-                    "p" => { proceed_with_splitting = true; break; },
+                    "r" => continue, // Restart the analysis loop for new settings
+                    "p" => { proceed_with_splitting = true; break; }, // Break out of analysis loop to proceed
                     _ => { println!("Invalid choice. Re-analyzing by default..."); continue; }
                 }
             }
-        } else { // process_type == "f" - default to proceed after asking settings once
-            proceed_with_splitting = true; // For folder processing, we always proceed after settings are given
-        }
+        } // End of analysis loop
 
         if proceed_with_splitting {
-            // Process each audio file
+            // Process each audio file with the chosen settings
             for audio_file_path in &input_paths {
-                println!("\n--- Processing: {} ---", audio_file_path.display());
+                println!("\n--- Splitting: {} ---", audio_file_path.display());
                 match perform_analysis_and_split(
                     audio_file_path,
                     &output_base_dir,
                     silence_threshold_seconds,
                     noise_threshold_db
                 ) {
-                    Ok(_) => println!("Successfully completed processing for {}.", audio_file_path.display()),
-                    Err(e) => eprintln!("An error occurred during processing {}: {}", audio_file_path.display(), e),
+                    Ok(_) => println!("Successfully completed splitting for {}.", audio_file_path.display()),
+                    Err(e) => eprintln!("An error occurred during splitting {}: {}", audio_file_path.display(), e),
                 }
             }
         } else {
-            // If processing single file and user chose not to proceed after re-analysis prompt
-            println!("Skipping audio splitting for the current file.");
+            // This path is taken if the user chose not to proceed after analysis
+            println!("No splitting performed for the current selection.");
         }
 
 
