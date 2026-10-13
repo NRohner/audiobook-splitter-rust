@@ -16,6 +16,8 @@ A command-line application written in Rust that intelligently splits long audio 
 
 * **Status Updates:** Provides regular progress updates during the detection and splitting process.
 
+* **AI Chapter Matching (optional):** Give it the book's EPUB and a local Whisper speech-to-text model transcribes ~20 seconds either side of each silence. The app splits only where the narration matches the start of an EPUB chapter, and names the files after the chapters (e.g. `03 - The Storm.mp3`). Everything runs offline on your machine.
+
 * **Multi-file Processing:** Option to process multiple audio files consecutively.
 
 ## Prerequisites
@@ -101,6 +103,7 @@ Before running this application, you need to have the following installed on you
 ## Quick Start (GUI)
 
 ```bash
+make model   # one-time: download the Whisper model (~148 MB) into models/
 make dev     # debug build, starts the GUI and opens your browser
 make build   # optimized single binary at target/release/audiobook-splitter-rust
 make run     # build + launch the release GUI
@@ -110,7 +113,15 @@ make cli     # original interactive terminal flow
 
 The GUI is a local web page served by the app itself at `http://127.0.0.1:7878` (it only listens on your machine). Pick an audio file or folder and an output folder (type a path or use the native **File** / **Folder** / **Browse** dialogs), set the detection thresholds, click **Analyze**, tweak and re-analyze until the segment counts look right, then click **Split files**.
 
-The binary is self-contained (the page is compiled in); FFmpeg/FFprobe still need to be on your PATH. Run it with `--cli` for the terminal version.
+The binary is self-contained (the page is compiled in); FFmpeg/FFprobe still need to be on your PATH. Building requires **CMake** (`brew install cmake` on macOS) because the Whisper speech-to-text engine (whisper.cpp) is compiled in; on Apple Silicon it runs on the GPU via Metal. `make dev`/`make run` download the model automatically on first use, or set `WHISPER_MODEL=/path/to/ggml-*.bin` to use a different one (e.g. `ggml-small.en.bin` for higher accuracy).
+
+### Matching chapters with an EPUB
+
+1. Fill in **Book EPUB** (the same edition as the audiobook works best; its table of contents should mark the chapters).
+2. Use a *looser* minimum silence than usual (e.g. 1.0-2.0 s): silences are only candidates now, and the transcript match decides which are real chapter breaks.
+3. Click **Analyze**. The results list each chapter break with a score (0-2: how well the speech after the pause matches the chapter's opening, plus how well the speech before it matches the previous chapter's ending) and what Whisper heard. Chapters with no match are listed; front matter like the copyright page usually isn't narrated, so that's expected.
+4. If real chapters are missing, lower the minimum silence or the **Chapter match threshold** (default 0.4) and analyze again.
+5. **Split files** writes one file per chapter. A chapter that crosses an audio file boundary becomes `NN - Title (part 2)`, and anything before the first chapter is `00 - Opening`. Run it with `--cli` for the terminal version.
 
 ## Usage (CLI)
 

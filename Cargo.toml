@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+epub = "2"
 regex = "1"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
+whisper-rs = { version = "0.16", features = ["metal"] }
+
+[dev-dependencies]
+zip = "9.0.2"

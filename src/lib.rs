@@ -1,4 +1,8 @@
 // Core audio-splitting logic shared by the CLI and the GUI.
+pub mod book;
+pub mod chapters;
+pub mod matching;
+pub mod transcribe;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -140,11 +144,13 @@ pub fn detect_silences(
 }
 
 // Writes one `<stem>_NNN.<ext>` file per segment into `out_dir`.
+// Uses `names[i]` for segment i when given (never overwriting an existing file).
 // `on_part(part, total, path)` is called before each part is written. Returns the number of files written.
 pub fn split_file(
     input: &Path,
     out_dir: &Path,
     points: &[f64],
+    names: Option<&[String]>,
     mut on_part: impl FnMut(usize, usize, &Path),
 ) -> Result<usize, String> {
     let ext = input.extension().unwrap_or_default().to_string_lossy().to_string();
@@ -159,7 +165,10 @@ pub fn split_file(
             start = end;
             continue;
         }
-        let out_path = out_dir.join(format!("{}_{:03}.{}", stem, index, ext));
+        let out_path = match names.and_then(|n| n.get(i)) {
+            Some(name) => unique_path(out_dir, name, &ext),
+            None => out_dir.join(format!("{}_{:03}.{}", stem, index, ext)),
+        };
         on_part(i + 1, points.len(), &out_path);
 
         let output = Command::new("ffmpeg")
@@ -183,6 +192,17 @@ pub fn split_file(
         written += 1;
     }
     Ok(written)
+}
+
+// `<dir>/<name>.<ext>`, or `<name> (2).<ext>` etc. if that already exists.
+pub fn unique_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
+    let mut path = dir.join(format!("{}.{}", name, ext));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{} ({}).{}", name, n, ext));
+        n += 1;
+    }
+    path
 }
 
 #[cfg(test)]
@@ -267,6 +287,15 @@ size=N/A time=00:00:10.00
         assert_eq!(collect_inputs(&file).unwrap(), vec![file.clone()]);
         assert_eq!(collect_inputs(&dir).unwrap(), vec![file]);
         assert!(collect_inputs(&dir.join("nope")).is_err());
+    }
+
+    #[test]
+    fn unique_path_never_reuses_existing_names() {
+        let dir = temp_dir("unique");
+        assert_eq!(unique_path(&dir, "01 - One", "mp3"), dir.join("01 - One.mp3"));
+        fs::write(dir.join("01 - One.mp3"), b"").unwrap();
+        fs::write(dir.join("01 - One (2).mp3"), b"").unwrap();
+        assert_eq!(unique_path(&dir, "01 - One", "mp3"), dir.join("01 - One (3).mp3"));
     }
 
     #[test]
