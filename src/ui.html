@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audiobook Splitter</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #fff; --text: #1d1c1a; --muted: #6b6862; --border: #e2dfd8;
+    --accent: #c2410c; --accent-text: #fff; --ok: #15803d; --err: #b91c1c; --track: #ebe8e1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161514; --card: #1f1e1c; --text: #ece9e3; --muted: #9a968e; --border: #33312d;
+      --accent: #f97316; --accent-text: #1a0f06; --ok: #4ade80; --err: #f87171; --track: #2c2a27;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
+  h1 svg { color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 14px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  .field { margin-bottom: 16px; }
+  .field:last-child { margin-bottom: 0; }
+  .row { display: flex; gap: 8px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } .row { flex-wrap: wrap; } }
+  input { flex: 1; min-width: 0; width: 100%; padding: 9px 11px; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 7px; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  button { display: inline-flex; align-items: center; gap: 6px; padding: 9px 14px; font: inherit; font-weight: 600; border-radius: 7px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  .error { color: var(--err); margin-top: 12px; min-height: 0; white-space: pre-wrap; }
+  .progress { height: 8px; background: var(--track); border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
+  .progress > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  .status-line { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 7px 4px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 13px; color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; width: 90px; }
+  td.bad { color: var(--err); font-size: 13px; }
+  pre { margin: 14px 0 0; padding: 12px; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M2 12h2M6 8v8M10 4v16M14 9v6M18 6v12M22 11v2"/></svg>
+    Audiobook Splitter
+  </h1>
+  <p class="sub">Split long audio files at the middle of each silence.</p>
+
+  <section>
+    <h2>Files</h2>
+    <div class="field">
+      <label for="input">Audio file or folder</label>
+      <div class="row">
+        <input id="input" placeholder="/path/to/book.mp3 or /path/to/folder" spellcheck="false">
+        <button type="button" data-browse="file" data-target="input"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>File</button>
+        <button type="button" data-browse="folder" data-target="input"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Folder</button>
+      </div>
+    </div>
+    <div class="field">
+      <label for="output">Output folder</label>
+      <div class="row">
+        <input id="output" placeholder="/path/to/output" spellcheck="false">
+        <button type="button" data-browse="folder" data-target="output"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Browse</button>
+      </div>
+      <div class="hint">Created if it doesn't exist. Existing splits are never overwritten.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Detection</h2>
+    <div class="grid">
+      <div class="field">
+        <label for="min_silence">Minimum silence (seconds)</label>
+        <input id="min_silence" type="number" min="0.1" step="0.1" value="2.0">
+        <div class="hint">Shorter values find more split points.</div>
+      </div>
+      <div class="field">
+        <label for="noise_db">Noise threshold (dB)</label>
+        <input id="noise_db" type="number" step="1" value="-40">
+        <div class="hint">Less negative values treat more sound as silence.</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="actions">
+    <button id="analyze" class="primary" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>Analyze</button>
+    <button id="split" type="button" disabled><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12"/></svg>Split files</button>
+  </div>
+  <div id="error" class="error" role="alert"></div>
+
+  <section id="results" hidden style="margin-top:16px">
+    <h2 id="results-title">Results</h2>
+    <div class="progress" role="progressbar" aria-label="Progress"><div id="bar"></div></div>
+    <div id="status-line" class="status-line"></div>
+    <table>
+      <thead><tr><th>File</th><th style="text-align:right">Segments</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const fields = ['input', 'output', 'min_silence', 'noise_db'];
+let analyzedKey = null; // settings used by the last analysis
+let polling = false;
+
+// Remember inputs between visits (per-browser convenience only).
+for (const f of fields) {
+  try { const v = localStorage.getItem('abs.' + f); if (v !== null) $(f).value = v; } catch {}
+  $(f).addEventListener('input', () => {
+    try { localStorage.setItem('abs.' + f, $(f).value); } catch {}
+    render(lastStatus);
+  });
+}
+
+const settingsKey = () => JSON.stringify([$('input').value.trim(), $('min_silence').value, $('noise_db').value]);
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function showError(e) { $('error').textContent = e ? e.message || String(e) : ''; }
+
+document.querySelectorAll('[data-browse]').forEach(btn => btn.addEventListener('click', async () => {
+  try {
+    const { path } = await api('/browse', { kind: btn.dataset.browse });
+    if (path) { $(btn.dataset.target).value = path; $(btn.dataset.target).dispatchEvent(new Event('input')); }
+  } catch (e) { showError(e); }
+}));
+
+$('analyze').addEventListener('click', async () => {
+  showError();
+  try {
+    await api('/analyze', {
+      input: $('input').value,
+      min_silence: parseFloat($('min_silence').value),
+      noise_db: parseFloat($('noise_db').value),
+    });
+    analyzedKey = settingsKey();
+    poll();
+  } catch (e) { showError(e); }
+});
+
+$('split').addEventListener('click', async () => {
+  showError();
+  try { await api('/split', { output: $('output').value }); poll(); }
+  catch (e) { showError(e); }
+});
+
+let lastStatus = null;
+function render(s) {
+  if (!s) return;
+  const segments = s.files.reduce((n, f) => n + (f.segments || 0), 0);
+  $('analyze').disabled = s.running;
+  $('split').disabled = s.running || s.phase !== 'analyze' || segments === 0
+    || analyzedKey !== settingsKey() || !$('output').value.trim();
+  if (!s.phase) return;
+
+  $('results').hidden = false;
+  $('results-title').textContent = s.phase === 'split' ? 'Splitting' : 'Analysis';
+  $('bar').style.width = (s.total ? 100 * s.done / s.total : 0) + '%';
+  $('status-line').textContent = s.running
+    ? (s.phase === 'split' ? `Writing part ${s.done} of ${s.total}` : `Analyzing file ${Math.min(s.done + 1, s.total)} of ${s.total}`)
+    : (s.phase === 'split' ? `Finished. ${s.total} segment(s) written.` : `${segments} segment(s) across ${s.files.length} file(s).`
+       + (analyzedKey !== settingsKey() ? ' Settings changed, analyze again to split.' : ''));
+
+  $('rows').replaceChildren(...s.files.map(f => {
+    const tr = document.createElement('tr');
+    const name = document.createElement('td'); name.textContent = f.name;
+    const val = document.createElement('td');
+    if (f.error) { val.className = 'bad'; val.textContent = f.error.split('\n')[0]; }
+    else { val.className = 'num'; val.textContent = f.segments ?? '...'; }
+    tr.append(name, val);
+    return tr;
+  }));
+  const log = $('log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  log.textContent = s.log.join('\n');
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    do {
+      lastStatus = await api('/status');
+      render(lastStatus);
+      if (lastStatus.running) await new Promise(r => setTimeout(r, 500));
+    } while (lastStatus.running);
+  } catch (e) { showError(e); }
+  polling = false;
+}
+
+poll();
+</script>
+</body>
+</html>
