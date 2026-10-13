@@ -98,13 +98,27 @@ Before running this application, you need to have the following installed on you
 3.  **Place the Source Code:**
     Replace the content of `src/main.rs` with the Rust code provided in the `rust-audio-splitter` Canvas.
 
-## Usage
+## Quick Start (GUI)
+
+```bash
+make dev     # debug build, starts the GUI and opens your browser
+make build   # optimized single binary at target/release/audiobook-splitter-rust
+make run     # build + launch the release GUI
+make test    # run the test suite
+make cli     # original interactive terminal flow
+```
+
+The GUI is a local web page served by the app itself at `http://127.0.0.1:7878` (it only listens on your machine). Pick an audio file or folder and an output folder (type a path or use the native **File** / **Folder** / **Browse** dialogs), set the detection thresholds, click **Analyze**, tweak and re-analyze until the segment counts look right, then click **Split files**.
+
+The binary is self-contained (the page is compiled in); FFmpeg/FFprobe still need to be on your PATH. Run it with `--cli` for the terminal version.
+
+## Usage (CLI)
 
 1.  **Compile and Run the Application:**
     Navigate to your project's root directory in your terminal or Command Prompt and run:
 
     ```bash
-    cargo run
+    make cli   # or: cargo run -- --cli
     ```
 
 2.  **Follow the Prompts:**

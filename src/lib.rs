@@ -1,14 +1,282 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+// Core audio-splitting logic shared by the CLI and the GUI.
+use regex::Regex;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+pub const AUDIO_EXTENSIONS: [&str; 6] = ["mp3", "wav", "flac", "aac", "m4a", "ogg"];
+
+// A detected silence region, in seconds.
+#[derive(Debug, PartialEq)]
+pub struct Silence {
+    pub start: f64,
+    pub end: f64,
+    pub duration: f64,
+}
+
+// Returns the supported audio files directly inside `dir`, sorted by file name.
+pub fn scan_folder(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read folder '{}': {}", dir.display(), e))?;
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        })
+        .collect();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    Ok(files)
+}
+
+// A file path yields just that file; a folder yields its audio files.
+pub fn collect_inputs(path: &Path) -> Result<Vec<PathBuf>, String> {
+    if path.is_file() {
+        Ok(vec![path.to_path_buf()])
+    } else if path.is_dir() {
+        scan_folder(path)
+    } else {
+        Err(format!("'{}' is not a file or folder.", path.display()))
+    }
+}
+
+// Parses FFmpeg `silencedetect` log output into silence regions.
+pub fn parse_silencedetect(log: &str) -> Vec<Silence> {
+    let re_start = Regex::new(r"silence_start: (?P<start>-?\d+(\.\d+)?)").unwrap();
+    let re_end = Regex::new(
+        r"silence_end: (?P<end>-?\d+(\.\d+)?) \| silence_duration: (?P<duration>-?\d+(\.\d+)?)",
+    )
+    .unwrap();
+
+    let mut starts: Vec<f64> = Vec::new();
+    let mut silences = Vec::new();
+    for line in log.lines() {
+        if let Some(cap) = re_start.captures(line) {
+            starts.push(cap["start"].parse().unwrap());
+        } else if let Some(cap) = re_end.captures(line) {
+            if let Some(start) = starts.pop() {
+                silences.push(Silence {
+                    start,
+                    end: cap["end"].parse().unwrap(),
+                    duration: cap["duration"].parse().unwrap(),
+                });
+            }
+        }
+    }
+    silences
+}
+
+// Split at the midpoint of each long-enough silence, plus the end of the file.
+// Empty when there is nothing to split.
+pub fn split_points(silences: &[Silence], min_silence: f64, total_duration: f64) -> Vec<f64> {
+    let mut points: Vec<f64> = silences
+        .iter()
+        .filter(|s| s.duration >= min_silence)
+        .map(|s| s.start + s.duration / 2.0)
+        .collect();
+    if points.last().is_some_and(|&last| last < total_duration - 0.01) {
+        points.push(total_duration);
+    }
+    points
+}
+
+// Next free index for `<stem>_NNN.<ext>` files in `dir`, so nothing gets overwritten.
+pub fn next_file_index(dir: &Path, stem: &str, ext: &str) -> Result<usize, String> {
+    let pattern = format!(r"^{}_(?P<index>\d{{3,}})\.{}$", regex::escape(stem), regex::escape(ext));
+    let file_regex = Regex::new(&pattern).map_err(|e| format!("Failed to build index regex: {}", e))?;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(1); // Folder doesn't exist yet.
+    };
+    let max_index = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            file_regex.captures(&name)?["index"].parse::<usize>().ok()
+        })
+        .max()
+        .unwrap_or(0);
+    Ok(max_index + 1)
+}
+
+// Runs FFmpeg silence detection and FFprobe, returning the silences and total duration.
+pub fn detect_silences(
+    input: &Path,
+    min_silence: f64,
+    noise_db: f64,
+) -> Result<(Vec<Silence>, f64), String> {
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-i")
+        .arg(input)
+        .arg("-af")
+        .arg(format!("silencedetect=n={}dB:d={}", noise_db, min_silence))
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg. Is FFmpeg installed and on your PATH? ({})", e))?;
+    let log = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("FFmpeg silence detection failed:\n{}", log));
+    }
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(input)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to run ffprobe. Is FFprobe installed and on your PATH? ({})", e))?;
+    if !probe.status.success() {
+        return Err(format!("FFprobe failed:\n{}", String::from_utf8_lossy(&probe.stderr)));
+    }
+    let total_duration = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| format!("Failed to parse audio duration: {}", e))?;
+
+    Ok((parse_silencedetect(&log), total_duration))
+}
+
+// Writes one `<stem>_NNN.<ext>` file per segment into `out_dir`.
+// `on_part(part, total, path)` is called before each part is written. Returns the number of files written.
+pub fn split_file(
+    input: &Path,
+    out_dir: &Path,
+    points: &[f64],
+    mut on_part: impl FnMut(usize, usize, &Path),
+) -> Result<usize, String> {
+    let ext = input.extension().unwrap_or_default().to_string_lossy().to_string();
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("audio_part");
+    let mut index = next_file_index(out_dir, stem, &ext)?;
+    let mut start = 0.0;
+    let mut written = 0;
+
+    for (i, &end) in points.iter().enumerate() {
+        let duration = end - start;
+        if duration <= 0.01 {
+            start = end;
+            continue;
+        }
+        let out_path = out_dir.join(format!("{}_{:03}.{}", stem, index, ext));
+        on_part(i + 1, points.len(), &out_path);
+
+        let output = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(input)
+            .args(["-ss", &start.to_string(), "-t", &duration.to_string(), "-c", "copy", "-y"])
+            .arg(&out_path)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("Failed to run ffmpeg for splitting: {}", e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "FFmpeg failed on part {}:\n{}",
+                i + 1,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        start = end;
+        index += 1;
+        written += 1;
+    }
+    Ok(written)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("abs-test-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn s(start: f64, duration: f64) -> Silence {
+        Silence { start, end: start + duration, duration }
+    }
 
     #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    fn parses_silencedetect_output() {
+        let log = "\
+[silencedetect @ 0x1] silence_start: 0
+[silencedetect @ 0x1] silence_end: 1.5 | silence_duration: 1.5
+size=N/A time=00:00:10.00
+[silencedetect @ 0x1] silence_start: -0.00133
+[silencedetect @ 0x1] silence_end: 2.25 | silence_duration: 2.25133
+[silencedetect @ 0x1] silence_start: 12.75
+[silencedetect @ 0x1] silence_end: 15.25 | silence_duration: 2.5";
+        assert_eq!(
+            parse_silencedetect(log),
+            vec![
+                Silence { start: 0.0, end: 1.5, duration: 1.5 },
+                Silence { start: -0.00133, end: 2.25, duration: 2.25133 },
+                Silence { start: 12.75, end: 15.25, duration: 2.5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn split_points_use_silence_midpoints_and_end() {
+        let points = split_points(&[s(10.0, 2.0), s(30.0, 4.0)], 2.0, 60.0);
+        assert_eq!(points, vec![11.0, 32.0, 60.0]);
+    }
+
+    #[test]
+    fn split_points_ignore_short_silences() {
+        assert_eq!(split_points(&[s(10.0, 1.0), s(30.0, 4.0)], 2.0, 60.0), vec![32.0, 60.0]);
+    }
+
+    #[test]
+    fn split_points_empty_without_silences() {
+        assert!(split_points(&[], 2.0, 60.0).is_empty());
+        assert!(split_points(&[s(10.0, 1.0)], 2.0, 60.0).is_empty());
+    }
+
+    #[test]
+    fn split_points_no_duplicate_end() {
+        // Silence midpoint lands on the end of the file.
+        assert_eq!(split_points(&[s(58.0, 4.0)], 2.0, 60.0), vec![60.0]);
+    }
+
+    #[test]
+    fn scan_folder_filters_and_sorts() {
+        let dir = temp_dir("scan");
+        for name in ["b.MP3", "a.wav", "notes.txt", "c.flac"] {
+            fs::write(dir.join(name), b"").unwrap();
+        }
+        fs::create_dir(dir.join("sub.mp3")).unwrap();
+        let names: Vec<_> = scan_folder(&dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.wav", "b.MP3", "c.flac"]);
+    }
+
+    #[test]
+    fn collect_inputs_handles_file_folder_and_missing() {
+        let dir = temp_dir("collect");
+        let file = dir.join("x.mp3");
+        fs::write(&file, b"").unwrap();
+        assert_eq!(collect_inputs(&file).unwrap(), vec![file.clone()]);
+        assert_eq!(collect_inputs(&dir).unwrap(), vec![file]);
+        assert!(collect_inputs(&dir.join("nope")).is_err());
+    }
+
+    #[test]
+    fn next_file_index_continues_after_highest() {
+        let dir = temp_dir("index");
+        assert_eq!(next_file_index(&dir, "book (1)", "mp3").unwrap(), 1);
+        for name in ["book (1)_001.mp3", "book (1)_007.mp3", "book (1)_009.wav", "other_020.mp3"] {
+            fs::write(dir.join(name), b"").unwrap();
+        }
+        assert_eq!(next_file_index(&dir, "book (1)", "mp3").unwrap(), 8);
+        assert_eq!(next_file_index(&dir.join("missing"), "book", "mp3").unwrap(), 1);
     }
 }
