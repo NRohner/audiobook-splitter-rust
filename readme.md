@@ -16,7 +16,7 @@ A command-line application written in Rust that intelligently splits long audio 
 
 * **Status Updates:** Provides regular progress updates during the detection and splitting process.
 
-* **AI Chapter Matching (optional):** Give it the book's EPUB and a local Whisper speech-to-text model transcribes ~20 seconds either side of each silence. The app splits only where the narration matches the start of an EPUB chapter, and names the files after the chapters (e.g. `03 - The Storm.mp3`). Everything runs offline on your machine.
+* **AI Chapter Matching (optional):** Give it the book's EPUB and a local Whisper speech-to-text model transcribes ~20 seconds either side of each silence. The app splits only where the narration matches the start of an EPUB chapter, and names the files after the chapters (e.g. `03 - The Storm.mp3`). In the GUI you can play 30 seconds from each matched break to check it by ear. Everything runs offline on your machine.
 
 * **Multi-file Processing:** Option to process multiple audio files consecutively.
 

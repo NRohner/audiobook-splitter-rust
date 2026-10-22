@@ -54,6 +54,8 @@
   th { font-size: 13px; color: var(--muted); font-weight: 600; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; width: 90px; }
   td.bad { color: var(--err); font-size: 13px; }
+  td.play { width: 44px; }
+  button.icon { padding: 7px; }
   pre { margin: 14px 0 0; padding: 12px; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
   [hidden] { display: none !important; }
 </style>
@@ -126,7 +128,7 @@
     <div class="progress" role="progressbar" aria-label="Progress"><div id="bar"></div></div>
     <div id="status-line" class="status-line"></div>
     <table id="breaks-table" hidden>
-      <thead><tr><th>Chapter break</th><th style="text-align:right">Score</th></tr></thead>
+      <thead><tr><th><span class="opt" style="margin:0">Listen</span></th><th>Chapter break</th><th style="text-align:right">Score</th></tr></thead>
       <tbody id="break-rows"></tbody>
     </table>
     <p id="missing" class="missing" hidden></p>
@@ -194,6 +196,34 @@ $('split').addEventListener('click', async () => {
   catch (e) { showError(e); }
 });
 
+// One shared player; `playing` is the break index being played, or null.
+const player = new Audio();
+let playing = null;
+const PLAY_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg>';
+const STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
+function setPlaying(i) {
+  playing = i;
+  document.querySelectorAll('[data-break]').forEach(btn => {
+    const on = Number(btn.dataset.break) === playing;
+    btn.innerHTML = on ? STOP_ICON : PLAY_ICON;
+    btn.setAttribute('aria-label', (on ? 'Stop ' : 'Play ') + btn.dataset.chapter);
+  });
+}
+function togglePlay(i) {
+  showError();
+  if (playing === i) { player.pause(); setPlaying(null); return; }
+  // Called straight from the click so Safari allows playback.
+  player.src = '/clip?break=' + i;
+  player.play().catch(() => {});
+  setPlaying(i);
+}
+player.addEventListener('ended', () => setPlaying(null));
+player.addEventListener('error', () => {
+  if (playing === null) return;
+  setPlaying(null);
+  showError(new Error('Could not play that clip. Try analyzing again.'));
+});
+
 let lastStatus = null;
 const clock = t => { t = Math.round(t); const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, sec = String(t % 60).padStart(2, '0'); return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`; };
 function transcriptLine(label, text) {
@@ -219,8 +249,15 @@ function render(s) {
        + (analyzedKey !== settingsKey() ? ' Settings changed, analyze again to split.' : ''));
 
   $('breaks-table').hidden = !s.breaks;
-  $('break-rows').replaceChildren(...(s.breaks || []).map(b => {
+  if (!s.breaks && playing !== null) { player.pause(); playing = null; }
+  $('break-rows').replaceChildren(...(s.breaks || []).map((b, i) => {
     const tr = document.createElement('tr');
+    const play = document.createElement('td'); play.className = 'play';
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'icon'; btn.dataset.break = i; btn.dataset.chapter = b.chapter;
+    btn.title = 'Play 30 seconds from the middle of the silence';
+    btn.addEventListener('click', () => togglePlay(i));
+    play.append(btn);
     const main = document.createElement('td');
     const name = document.createElement('div'); name.className = 'chapter-name'; name.textContent = b.chapter;
     const where = document.createElement('div'); where.className = 'where'; where.textContent = `${b.file} at ${clock(b.at)}`;
@@ -229,9 +266,10 @@ function render(s) {
     details.append(summary, transcriptLine('Before', b.before), transcriptLine('After', b.after));
     main.append(name, where, details);
     const score = document.createElement('td'); score.className = 'num'; score.textContent = b.score.toFixed(2);
-    tr.append(main, score);
+    tr.append(play, main, score);
     return tr;
   }));
+  setPlaying(playing);
   $('missing').hidden = !s.missing.length;
   $('missing').textContent = `No break found for: ${s.missing.join(', ')}. Front matter is usually not narrated; for real chapters try a shorter minimum silence or a lower match threshold.`;
 

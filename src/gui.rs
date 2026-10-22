@@ -5,7 +5,7 @@
 use audiobook_splitter_rust::book::load_chapters;
 use audiobook_splitter_rust::chapters::{candidates, chapter_plan, pick_breaks, transcribe_candidates, AudioFile, SplitJob};
 use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
-use audiobook_splitter_rust::{collect_inputs, detect_silences, split_file, split_points, AUDIO_EXTENSIONS};
+use audiobook_splitter_rust::{collect_inputs, detect_silences, preview_clip, split_file, split_points, AUDIO_EXTENSIONS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 const PAGE: &str = include_str!("ui.html");
 const DEFAULT_PORT: u16 = 7878;
+const CLIP_SECONDS: f64 = 30.0;
 
 #[derive(Serialize, Clone)]
 struct FileRow {
@@ -47,6 +48,8 @@ struct Status {
     log: Vec<String>,
     #[serde(skip)]
     plan: Vec<SplitJob>, // From the last analysis.
+    #[serde(skip)]
+    break_audio: Vec<(PathBuf, f64)>, // File and split time of each entry in `breaks`.
 }
 
 type Shared = Arc<Mutex<Status>>;
@@ -120,13 +123,22 @@ fn handle(mut req: Request, state: &Shared, port: u16) {
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
 
-    let result = match (req.method(), req.url()) {
+    let url = req.url().to_string();
+    let (route, query) = url.split_once('?').unwrap_or((&url, ""));
+    let result = match (req.method(), route) {
         (Method::Get, "/") => {
             let html = Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
             let _ = req.respond(Response::from_string(PAGE).with_header(html));
             return;
         }
         (Method::Get, "/status") => Ok(serde_json::to_value(&*state.lock().unwrap()).unwrap()),
+        (Method::Get, "/clip") => match clip(state, query) {
+            Ok(mp3) => {
+                respond_audio(req, mp3);
+                return;
+            }
+            Err(e) => Err(e),
+        },
         (Method::Post, "/browse") => parse(&body).and_then(browse),
         (Method::Post, "/analyze") => parse(&body).and_then(|r| start_analyze(r, state)),
         (Method::Post, "/split") => parse(&body).and_then(|r| start_split(r, state)),
@@ -142,6 +154,35 @@ fn handle(mut req: Request, state: &Shared, port: u16) {
     };
     let ct = Header::from_bytes("Content-Type", "application/json").unwrap();
     let _ = req.respond(Response::from_string(value.to_string()).with_status_code(code).with_header(ct));
+}
+
+// Safari only plays <audio> from servers that honour Range requests.
+// ponytail: each range request re-cuts the clip; cache the last clip if that gets slow.
+fn respond_audio(req: Request, mp3: Vec<u8>) {
+    let len = mp3.len();
+    let range = byte_range(header(&req, "Range").as_deref(), len);
+    let (code, body) = match range {
+        Some((start, end)) => (206, mp3[start..=end].to_vec()),
+        None => (200, mp3),
+    };
+    let mut response = Response::from_data(body)
+        .with_status_code(code)
+        .with_header(Header::from_bytes("Content-Type", "audio/mpeg").unwrap())
+        .with_header(Header::from_bytes("Accept-Ranges", "bytes").unwrap());
+    if let Some((start, end)) = range {
+        let value = format!("bytes {}-{}/{}", start, end, len);
+        response = response.with_header(Header::from_bytes("Content-Range", value).unwrap());
+    }
+    let _ = req.respond(response);
+}
+
+// `bytes=start-[end]` as an inclusive range within `len` bytes; None means send everything.
+fn byte_range(header: Option<&str>, len: usize) -> Option<(usize, usize)> {
+    let (start, end) = header?.strip_prefix("bytes=")?.split_once('-')?;
+    let start: usize = start.parse().ok()?;
+    let last = len.checked_sub(1)?;
+    let end = if end.is_empty() { last } else { end.parse::<usize>().ok()?.min(last) };
+    (start <= end).then_some((start, end))
 }
 
 fn header(req: &Request, name: &'static str) -> Option<String> {
@@ -174,6 +215,17 @@ pub fn pick(kind: &str) {
     if let Some(path) = picked {
         print!("{}", path.to_string_lossy());
     }
+}
+
+// `break=N`: CLIP_SECONDS of audio from the middle of break N's silence. Takes an
+// index rather than a path so the page can only play files from the analysis.
+fn clip(state: &Shared, query: &str) -> Result<Vec<u8>, String> {
+    let (path, at) = query
+        .strip_prefix("break=")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|n| state.lock().unwrap().break_audio.get(n).cloned())
+        .ok_or("Unknown chapter break. Analyze again.")?;
+    preview_clip(&path, at, CLIP_SECONDS)
 }
 
 fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
@@ -310,6 +362,7 @@ fn match_with_epub(
             })
             .collect(),
     );
+    s.break_audio = m.breaks.iter().map(|b| (files[b.file].path.clone(), b.at)).collect();
     s.missing = m.missing.iter().map(|&ch| title(ch)).collect();
     s.log.push(format!("Matched {} of {} chapters.", m.breaks.len(), chapters.len()));
     Ok(plan)
@@ -367,4 +420,29 @@ fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
 
 fn file_name(path: &std::path::Path) -> String {
     path.file_name().unwrap_or_default().to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_rejects_unknown_breaks() {
+        let state: Shared = Arc::default();
+        assert!(clip(&state, "break=0").is_err());
+        assert!(clip(&state, "break=x").is_err());
+        assert!(clip(&state, "").is_err());
+    }
+
+    #[test]
+    fn byte_range_parses_requests() {
+        assert_eq!(byte_range(None, 100), None);
+        assert_eq!(byte_range(Some("bytes=0-1"), 100), Some((0, 1)));
+        assert_eq!(byte_range(Some("bytes=10-"), 100), Some((10, 99)));
+        assert_eq!(byte_range(Some("bytes=50-500"), 100), Some((50, 99)));
+        assert_eq!(byte_range(Some("bytes=100-"), 100), None);
+        assert_eq!(byte_range(Some("bytes=9-3"), 100), None);
+        assert_eq!(byte_range(Some("junk"), 100), None);
+        assert_eq!(byte_range(Some("bytes=0-"), 0), None);
+    }
 }
