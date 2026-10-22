@@ -89,6 +89,24 @@ fn toc_entries<R: std::io::Read + std::io::Seek>(doc: &mut epub::doc::EpubDoc<R>
         return out;
     }
 
+    // The crate only reads an NCX named by `<spine toc="...">`, which Calibre often omits.
+    let ncx_path = doc.resources.values().find(|r| r.mime == "application/x-dtbncx+xml").map(|r| r.path.clone());
+    if let Some(ncx_path) = ncx_path {
+        let xml = doc.get_resource_str_by_path(&ncx_path).unwrap_or_default();
+        let ncx_dir = ncx_path.parent().unwrap_or(Path::new(""));
+        let point = regex::Regex::new(
+            r#"(?s)<navLabel>\s*<text>(.*?)</text>\s*</navLabel>\s*<content\b[^>]*\bsrc\s*=\s*["']([^"']*)["']"#,
+        )
+        .unwrap();
+        for cap in point.captures_iter(&xml) {
+            let title = html_to_text(&cap[1]).split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push((title, ncx_dir.join(&cap[2]).to_string_lossy().to_string()));
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
     let Some(nav_path) = doc.get_nav_id().and_then(|id| doc.resources.get(&id).map(|r| r.path.clone())) else {
         return out;
     };
@@ -175,7 +193,8 @@ mod tests {
     }
 
     // Builds an EPUB with: cover (no text), ch1, a short "Part Two" page,
-    // ch2 and ch3 sharing one file split by an anchor. `toc` is "ncx" or "nav".
+    // ch2 and ch3 sharing one file split by an anchor. `toc` is "ncx", "nav", or
+    // "loose-ncx": an NCX the spine doesn't point to (as Calibre writes them).
     fn build_epub(name: &str, toc: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("abs-{}-{}.epub", name, std::process::id()));
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
@@ -187,8 +206,10 @@ mod tests {
 
         add("mimetype", "application/epub+zip");
         add("META-INF/container.xml", r#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#);
-        let (version, toc_item, spine_attr) = if toc == "ncx" {
-            ("2.0", r#"<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>"#, r#" toc="ncx""#)
+        let ncx = toc != "nav";
+        let (version, toc_item, spine_attr) = if ncx {
+            let attr = if toc == "ncx" { r#" toc="ncx""# } else { "" };
+            ("2.0", r#"<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>"#, attr)
         } else {
             ("3.0", r#"<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>"#, "")
         };
@@ -211,7 +232,7 @@ mod tests {
             ("Chapter Two", "Text/ch23.xhtml"),
             ("Chapter Three", "Text/ch23.xhtml#c3"),
         ];
-        if toc == "ncx" {
+        if ncx {
             let points: String = entries.iter().enumerate().map(|(i, (label, src))| format!(
                 r#"<navPoint id="n{i}" playOrder="{}"><navLabel><text>{label}</text></navLabel><content src="{src}"/></navPoint>"#, i + 1
             )).collect();
@@ -243,6 +264,11 @@ mod tests {
     #[test]
     fn loads_epub2_ncx_toc() {
         check(&load_chapters(&build_epub("ncx", "ncx")).unwrap());
+    }
+
+    #[test]
+    fn loads_ncx_the_spine_does_not_reference() {
+        check(&load_chapters(&build_epub("loose-ncx", "loose-ncx")).unwrap());
     }
 
     #[test]
