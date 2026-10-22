@@ -22,7 +22,7 @@ pub fn find_model() -> Result<PathBuf, String> {
         .flatten()
         .map(|dir| dir.join(MODEL_FILE))
         .find(|p| p.is_file())
-        .ok_or_else(|| format!("Whisper model '{}' not found. Run `make model` to download it.", MODEL_FILE))
+        .ok_or_else(|| format!("Whisper model '{}' not found. Download it into models/ (`make model`, or see the README on Windows).", MODEL_FILE))
 }
 
 pub struct Transcriber {

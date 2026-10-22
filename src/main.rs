@@ -4,9 +4,8 @@ use audiobook_splitter_rust::book::{book_info, load_chapters};
 use audiobook_splitter_rust::chapters::{candidates, chapter_breaks, pick_breaks, plan_from_breaks, transcribe_candidates, AudioFile, SplitJob};
 use audiobook_splitter_rust::meta::{tracks, Metadata, DEFAULT_TEMPLATE};
 use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
-use audiobook_splitter_rust::{collect_inputs, detect_silences, split_file, split_points};
+use audiobook_splitter_rust::{collect_inputs, detect_silences, split_file, split_points, user_path};
 use std::io::{self, Write};
-use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -48,8 +47,8 @@ fn process_selection() {
     let input_paths = loop {
         let choice = prompt("Do you want to process a (s)ingle file or a (f)older of files? (s/f): ").to_lowercase();
         let path = match choice.as_str() {
-            "s" => PathBuf::from(prompt("Enter the path to the audio file (e.g., audio.mp3 or C:\\path\\to\\audio.wav): ")),
-            "f" => PathBuf::from(prompt("Enter the path to the folder containing audio files: ")),
+            "s" => user_path(&prompt("Enter the path to the audio file (e.g., audio.mp3 or C:\\path\\to\\audio.wav): ")),
+            "f" => user_path(&prompt("Enter the path to the folder containing audio files: ")),
             _ => {
                 println!("Invalid choice. Please enter 's' or 'f'.");
                 continue;
@@ -66,7 +65,7 @@ fn process_selection() {
     };
 
     let output_dir = loop {
-        let dir = PathBuf::from(prompt("Enter the base output directory (e.g., output_splits or C:\\MyAudioSplits): "));
+        let dir = user_path(&prompt("Enter the base output directory (e.g., output_splits or C:\\MyAudioSplits): "));
         if dir.is_dir() {
             break dir;
         } else if dir.exists() {
@@ -83,11 +82,10 @@ fn process_selection() {
 
     // Optional EPUB: splits only where the transcript matches a chapter start.
     let epub = loop {
-        let path = prompt("Optional: path to the book's EPUB to match chapters with AI (Enter to skip): ");
-        if path.is_empty() {
+        let path = user_path(&prompt("Optional: path to the book's EPUB to match chapters with AI (Enter to skip): "));
+        if path.as_os_str().is_empty() {
             break None;
         }
-        let path = PathBuf::from(&path);
         match load_chapters(&path).and_then(|ch| Ok((ch, book_info(&path)?, find_model()?))) {
             Ok((chapters, (album, artist, year), model)) => {
                 println!("Status: EPUB has {} chapters.", chapters.len());
