@@ -10,6 +10,14 @@ use std::process::{Command, Stdio};
 
 pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "m4b", "wav", "flac", "aac", "m4a", "ogg"];
 
+// A path the user typed or pasted, without surrounding whitespace or the quotes
+// Windows Explorer's "Copy as path" adds.
+pub fn user_path(input: &str) -> PathBuf {
+    let s = input.trim();
+    let unquoted = ['"', '\''].iter().find_map(|&q| s.strip_prefix(q)?.strip_suffix(q));
+    PathBuf::from(unquoted.unwrap_or(s))
+}
+
 // A detected silence region, in seconds.
 #[derive(Debug, PartialEq)]
 pub struct Silence {
@@ -248,6 +256,15 @@ mod tests {
 
     fn s(start: f64, duration: f64) -> Silence {
         Silence { start, end: start + duration, duration }
+    }
+
+    #[test]
+    fn user_path_strips_surrounding_quotes() {
+        assert_eq!(user_path(r#" "C:\Books\Dune.m4b" "#), PathBuf::from(r"C:\Books\Dune.m4b"));
+        assert_eq!(user_path("'/tmp/a b.mp3'"), PathBuf::from("/tmp/a b.mp3"));
+        assert_eq!(user_path("  plain.mp3\n"), PathBuf::from("plain.mp3"));
+        assert_eq!(user_path(r#""half.mp3"#), PathBuf::from(r#""half.mp3"#));
+        assert_eq!(user_path(""), PathBuf::from(""));
     }
 
     #[test]

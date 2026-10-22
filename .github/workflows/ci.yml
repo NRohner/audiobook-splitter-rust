@@ -1,0 +1,42 @@
+name: CI
+
+# Builds and tests every pull request into master, so it must pass before merging.
+on:
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target_dir: target
+          # whisper.cpp's Vulkan build overflows Windows' 260-character path limit under the
+          # checkout's target\ folder, so build in a short path instead (see README).
+          - os: windows-latest
+            target_dir: C:\abs-target
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TARGET_DIR: ${{ matrix.target_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> ${{ matrix.target_dir }}"
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          install_runtime: false
+          cache: true
+      - run: cargo build --release
+      - run: cargo test

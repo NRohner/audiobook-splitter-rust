@@ -1,4 +1,3 @@
-BIN := target/release/audiobook-splitter-rust
 MODEL := models/ggml-base.en.bin
 
 .PHONY: dev build run test cli model
@@ -6,11 +5,11 @@ MODEL := models/ggml-base.en.bin
 dev: $(MODEL)    ## Debug build, opens the GUI
 	cargo run
 
-build:   ## Optimized single binary at $(BIN)
+build:   ## Optimized single binary in target/release (or $CARGO_TARGET_DIR/release)
 	cargo build --release
 
-run: build $(MODEL) ## Build and launch the release GUI
-	./$(BIN)
+run: $(MODEL) ## Build and launch the release GUI
+	cargo run --release
 
 test:
 	cargo test

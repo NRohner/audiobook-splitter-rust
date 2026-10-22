@@ -239,7 +239,18 @@ pub fn sanitize_file_name(name: &str) -> String {
         .map(|c| if c.is_control() || "/\\*?\"<>|".contains(c) { '_' } else { c })
         .take(120)
         .collect();
-    if name.is_empty() { "Untitled".to_string() } else { name }
+    // Windows drops trailing dots/spaces, so trim again after truncating.
+    let name = name.trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+    if name.is_empty() {
+        return "Untitled".to_string();
+    }
+    // Device names Windows won't create as files, with or without an extension.
+    let upper = name.to_ascii_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&upper.as_str())
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
+    if reserved { format!("{}_", name) } else { name.to_string() }
 }
 
 #[cfg(test)]
@@ -386,5 +397,18 @@ mod tests {
         assert_eq!(sanitize_file_name(" a/b\\c*?\"<>|\n "), "a_b_c______");
         assert_eq!(sanitize_file_name("..."), "Untitled");
         assert_eq!(sanitize_file_name(&"x".repeat(300)).len(), 120);
+    }
+
+    #[test]
+    fn sanitize_file_name_avoids_windows_pitfalls() {
+        assert_eq!(sanitize_file_name("Con"), "Con_");
+        assert_eq!(sanitize_file_name("nul"), "nul_");
+        assert_eq!(sanitize_file_name("COM1"), "COM1_");
+        assert_eq!(sanitize_file_name("Lpt9"), "Lpt9_");
+        assert_eq!(sanitize_file_name("Console"), "Console");
+        assert_eq!(sanitize_file_name("COM0"), "COM0");
+        // Windows strips trailing dots/spaces, so truncation mustn't leave any.
+        let long = format!("{} end", "x".repeat(119));
+        assert_eq!(sanitize_file_name(&long), "x".repeat(119));
     }
 }

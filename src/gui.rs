@@ -8,10 +8,9 @@ use audiobook_splitter_rust::chapters::{
 };
 use audiobook_splitter_rust::meta::{tracks, Metadata, DEFAULT_TEMPLATE};
 use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
-use audiobook_splitter_rust::{collect_inputs, detect_silences, preview_clip, split_file, split_points, AUDIO_EXTENSIONS};
+use audiobook_splitter_rust::{collect_inputs, detect_silences, preview_clip, split_file, split_points, user_path, AUDIO_EXTENSIONS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -260,18 +259,20 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
     if !(0.0..=1.0).contains(&req.threshold) {
         return Err("Match threshold must be between 0 and 1.".into());
     }
-    let inputs = collect_inputs(&PathBuf::from(req.input.trim()))?;
+    let inputs = collect_inputs(&user_path(&req.input))?;
     if inputs.is_empty() {
         return Err("No supported audio files found in that folder.".into());
     }
     // Fail fast on a bad EPUB or missing model, before any slow work starts.
-    let epub = match req.epub.trim() {
-        "" => None,
-        path => Some((load_chapters(&PathBuf::from(path))?, find_model()?)),
+    let epub_path = user_path(&req.epub);
+    let epub = if epub_path.as_os_str().is_empty() {
+        None
+    } else {
+        Some((load_chapters(&epub_path)?, find_model()?))
     };
     let mut meta = Metadata { genre: "Audiobook".into(), template: DEFAULT_TEMPLATE.into(), ..Default::default() };
     if epub.is_some() {
-        (meta.album, meta.artist, meta.year) = book_info(&PathBuf::from(req.epub.trim()))?;
+        (meta.album, meta.artist, meta.year) = book_info(&epub_path)?;
     }
 
     {
@@ -397,8 +398,8 @@ fn match_with_epub(
 }
 
 fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
-    let output = PathBuf::from(req.output.trim());
-    if req.output.trim().is_empty() {
+    let output = user_path(&req.output);
+    if output.as_os_str().is_empty() {
         return Err("Choose an output folder.".into());
     }
     if output.exists() && !output.is_dir() {

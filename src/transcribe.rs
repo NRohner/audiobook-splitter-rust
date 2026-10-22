@@ -1,4 +1,4 @@
-// Local speech-to-text with Whisper (whisper.cpp, Metal GPU on Apple Silicon).
+// Local speech-to-text with Whisper (whisper.cpp: Metal GPU on macOS, Vulkan GPU on Windows).
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
@@ -22,7 +22,7 @@ pub fn find_model() -> Result<PathBuf, String> {
         .flatten()
         .map(|dir| dir.join(MODEL_FILE))
         .find(|p| p.is_file())
-        .ok_or_else(|| format!("Whisper model '{}' not found. Run `make model` to download it.", MODEL_FILE))
+        .ok_or_else(|| format!("Whisper model '{}' not found. Download it into models/ (`make model`, or see the README on Windows).", MODEL_FILE))
 }
 
 pub struct Transcriber {
@@ -77,16 +77,36 @@ mod tests {
     use super::*;
     use crate::matching::{bigram_score, normalize};
 
-    // Needs the model (`make model`) and macOS `say`: cargo test -- --ignored
+    // Writes `text` as speech to a temp file with the OS text-to-speech engine.
+    #[cfg(target_os = "macos")]
+    fn speak(text: &str) -> PathBuf {
+        let aiff = std::env::temp_dir().join(format!("abs-say-{}.aiff", std::process::id()));
+        assert!(Command::new("say").arg("-o").arg(&aiff).arg(text).status().unwrap().success());
+        aiff
+    }
+
+    #[cfg(windows)]
+    fn speak(text: &str) -> PathBuf {
+        let wav = std::env::temp_dir().join(format!("abs-say-{}.wav", std::process::id()));
+        let script = format!(
+            "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+             $s.SetOutputToWaveFile('{}'); $s.Speak('{}'); $s.Dispose()",
+            wav.display(),
+            text.replace('\'', "''")
+        );
+        assert!(Command::new("powershell").args(["-NoProfile", "-Command", &script]).status().unwrap().success());
+        wav
+    }
+
+    // Needs the model (`make model`) and the OS text-to-speech engine: cargo test -- --ignored
     #[test]
     #[ignore]
     fn transcribes_speech_close_to_text() {
         let text = "It was a bright cold day in April, and the clocks were striking thirteen. \
                     Winston Smith slipped quickly through the glass doors of Victory Mansions.";
-        let aiff = std::env::temp_dir().join(format!("abs-say-{}.aiff", std::process::id()));
-        assert!(Command::new("say").arg("-o").arg(&aiff).arg(text).status().unwrap().success());
+        let audio = speak(text);
 
-        let samples = clip_samples(&aiff, 0.0, 30.0).unwrap();
+        let samples = clip_samples(&audio, 0.0, 30.0).unwrap();
         assert!(samples.len() > 16000);
         let mut t = Transcriber::load(&find_model().unwrap()).unwrap();
         let started = std::time::Instant::now();

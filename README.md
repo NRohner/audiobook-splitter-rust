@@ -33,6 +33,8 @@ You need four things on any platform:
 * **FFmpeg and FFprobe** on your `PATH`: the app uses them to analyze and split audio.
 * The **Whisper model** (`models/ggml-base.en.bin`, ~148 MB): downloaded once, see below.
 
+Windows also needs the **Vulkan SDK**, so Whisper can run on the GPU.
+
 ### macOS
 
 1.  **Install the Xcode command line tools** (C/C++ compiler and `make`):
@@ -67,11 +69,17 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
 
 1.  **Install Rust:** download and run `rustup-init.exe` from <https://www.rust-lang.org/tools/install>. When asked, let it install the **Visual Studio C++ Build Tools** (the "Desktop development with C++" workload); that is the C/C++ compiler.
 
-2.  **Install CMake and Git:**
+2.  **Install CMake, Git, LLVM and the Vulkan SDK** (LLVM provides `libclang.dll`, which the Whisper bindings need at build time; the Vulkan SDK lets Whisper run on any NVIDIA, AMD or Intel GPU):
 
     ```powershell
-    winget install Kitware.CMake Git.Git
+    winget install Kitware.CMake Git.Git LLVM.LLVM KhronosGroup.VulkanSDK
+    [Environment]::SetEnvironmentVariable("LIBCLANG_PATH", "C:\Program Files\LLVM\bin", "User")
+    [Environment]::SetEnvironmentVariable("CARGO_TARGET_DIR", "C:\abs-target", "User")
     ```
+
+    The Vulkan SDK installer sets `VULKAN_SDK` for you. `CARGO_TARGET_DIR` moves the build folder to a short path: whisper.cpp's GPU code builds files nested so deep that, under the repo's `target\` folder, they pass Windows' 260-character path limit and the build fails. The built binary is then `C:\abs-target\release\audiobook-splitter-rust.exe`; run it (or `cargo run`) from the repo folder so it finds `models\`.
+
+    Nothing GPU-specific is needed to *run* the app: your graphics driver already includes Vulkan. Without a usable GPU, Whisper falls back to the CPU (roughly 50 times slower).
 
 3.  **Install FFmpeg and FFprobe.** The quickest way is winget, which also adds them to your `PATH`:
 
@@ -94,6 +102,8 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
     ```powershell
     cargo --version
     cmake --version
+    Test-Path "$env:LIBCLANG_PATH\libclang.dll"   # should print True
+    Test-Path "$env:VULKAN_SDK\Lib\vulkan-1.lib"  # should print True
     ffmpeg -version
     ffprobe -version
     ```
@@ -116,7 +126,7 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
 |---|---|---|
 | `make model` | see step 5 above | One-time: download the Whisper model into `models/` |
 | `make dev` | `cargo run` | Debug build, starts the GUI and opens your browser |
-| `make build` | `cargo build --release` | Optimized single binary at `target/release/audiobook-splitter-rust` (`.exe` on Windows) |
+| `make build` | `cargo build --release` | Optimized single binary at `target/release/audiobook-splitter-rust` (`C:\abs-target\release\audiobook-splitter-rust.exe` on Windows) |
 | `make run` | `cargo run --release` | Build and launch the release GUI |
 | `make test` | `cargo test` | Run the test suite |
 | `make cli` | `cargo run -- --cli` | Original interactive terminal flow |
