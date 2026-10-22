@@ -75,6 +75,13 @@ pub fn load_chapters(path: &Path) -> Result<Vec<Chapter>, String> {
     Ok(chapters)
 }
 
+// The EPUB's title, author and year, for suggesting tags. Missing values are empty.
+pub fn book_info(path: &Path) -> Result<(String, String, String), String> {
+    let doc = epub::doc::EpubDoc::new(path).map_err(|e| format!("Failed to open EPUB '{}': {}", path.display(), e))?;
+    let get = |key: &str| doc.mdata(key).map(|m| m.value.trim().to_string()).unwrap_or_default();
+    Ok((get("title"), get("creator"), get("date").chars().take(4).collect()))
+}
+
 // (title, "path/in/zip.xhtml#fragment") from the EPUB2 NCX or the EPUB3 nav document.
 fn toc_entries<R: std::io::Read + std::io::Seek>(doc: &mut epub::doc::EpubDoc<R>) -> Vec<(String, String)> {
     fn flatten(points: &[epub::doc::NavPoint], out: &mut Vec<(String, String)>) {
@@ -214,7 +221,7 @@ mod tests {
             ("3.0", r#"<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>"#, "")
         };
         add("OEBPS/content.opf", &format!(
-            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="{version}" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">x</dc:identifier><dc:title>T</dc:title></metadata><manifest>{toc_item}<item id="cover" href="Text/cover.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="Text/ch1.xhtml" media-type="application/xhtml+xml"/><item id="p2" href="Text/part2.xhtml" media-type="application/xhtml+xml"/><item id="c23" href="Text/ch23.xhtml" media-type="application/xhtml+xml"/></manifest><spine{spine_attr}><itemref idref="cover"/><itemref idref="c1"/><itemref idref="p2"/><itemref idref="c23"/></spine></package>"#
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="{version}" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">x</dc:identifier><dc:title>T</dc:title><dc:creator>Herman Melville</dc:creator><dc:date>1851-10-18</dc:date></metadata><manifest>{toc_item}<item id="cover" href="Text/cover.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="Text/ch1.xhtml" media-type="application/xhtml+xml"/><item id="p2" href="Text/part2.xhtml" media-type="application/xhtml+xml"/><item id="c23" href="Text/ch23.xhtml" media-type="application/xhtml+xml"/></manifest><spine{spine_attr}><itemref idref="cover"/><itemref idref="c1"/><itemref idref="p2"/><itemref idref="c23"/></spine></package>"#
         ));
         add("OEBPS/Text/cover.xhtml", &page(r#"<img src="cover.jpg"/>"#));
         add("OEBPS/Text/ch1.xhtml", &page(&format!("<h1>Chapter 1</h1>{}", para("Alpha &amp; words", 12))));
@@ -269,6 +276,12 @@ mod tests {
     #[test]
     fn loads_ncx_the_spine_does_not_reference() {
         check(&load_chapters(&build_epub("loose-ncx", "loose-ncx")).unwrap());
+    }
+
+    #[test]
+    fn book_info_reads_title_author_and_year() {
+        let info = book_info(&build_epub("info", "ncx")).unwrap();
+        assert_eq!(info, ("T".into(), "Herman Melville".into(), "1851".into()));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 pub mod book;
 pub mod chapters;
 pub mod matching;
+pub mod meta;
 pub mod transcribe;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -159,13 +160,13 @@ pub fn preview_clip(input: &Path, start: f64, seconds: f64) -> Result<Vec<u8>, S
 }
 
 // Writes one `<stem>_NNN.<ext>` file per segment into `out_dir`.
-// Uses `names[i]` for segment i when given (never overwriting an existing file).
+// With `tracks`, segment i is named and tagged by `tracks[i]` (never overwriting an existing file).
 // `on_part(part, total, path)` is called before each part is written. Returns the number of files written.
 pub fn split_file(
     input: &Path,
     out_dir: &Path,
     points: &[f64],
-    names: Option<&[String]>,
+    tracks: Option<&[meta::Track]>,
     mut on_part: impl FnMut(usize, usize, &Path),
 ) -> Result<usize, String> {
     let ext = input.extension().unwrap_or_default().to_string_lossy().to_string();
@@ -181,8 +182,9 @@ pub fn split_file(
             start = end;
             continue;
         }
-        let out_path = match names.and_then(|n| n.get(i)) {
-            Some(name) => unique_path(out_dir, name, &ext),
+        let track = tracks.and_then(|t| t.get(i));
+        let out_path = match track {
+            Some(track) => unique_path(out_dir, &track.name, &ext),
             None => out_dir.join(format!("{}_{:03}.{}", stem, index, ext)),
         };
         on_part(i + 1, points.len(), &out_path);
@@ -195,6 +197,9 @@ pub fn split_file(
         // tracks stored as MJPEG video. Re-attach covers with a remux if anyone misses them.
         if no_video {
             cmd.arg("-vn");
+        }
+        for (key, value) in track.map_or(&[][..], |t| &t.tags) {
+            cmd.arg("-metadata").arg(format!("{}={}", key, value));
         }
         let output = cmd
             .arg("-y")
@@ -318,6 +323,36 @@ size=N/A time=00:00:10.00
         let out = dir.join("out");
         fs::create_dir(&out).unwrap();
         assert_eq!(split_file(&dir.join("book.m4b"), &out, &[3.0, 6.0], None, |_, _, _| {}), Ok(2));
+    }
+
+    #[test]
+    fn split_file_writes_track_names_and_tags() {
+        let dir = temp_dir("tags");
+        let mp3 = dir.join("book.mp3");
+        let made = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=d=4", "-metadata", "genre=Source", "-y"])
+            .arg(&mp3)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let track = |name: &str, n: usize| meta::Track {
+            name: name.into(),
+            tags: vec![("title".into(), name.into()), ("track".into(), format!("{}/2", n)), ("disc".into(), "1/1".into())],
+        };
+        let out = dir.join("out");
+        fs::create_dir(&out).unwrap();
+        let tracks = [track("00 - Opening", 1), track("01 - One", 2)];
+        assert_eq!(split_file(&mp3, &out, &[2.0, 4.0], Some(&tracks), |_, _, _| {}), Ok(2));
+
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format_tags=title,track,disc,genre", "-of", "default=noprint_wrappers=1"])
+            .arg(out.join("01 - One.mp3"))
+            .output()
+            .unwrap();
+        let tags = String::from_utf8_lossy(&probe.stdout).to_lowercase();
+        for want in ["title=01 - one", "track=2/2", "disc=1/1", "genre=source"] {
+            assert!(tags.contains(want), "missing {} in {}", want, tags);
+        }
     }
 
     #[test]

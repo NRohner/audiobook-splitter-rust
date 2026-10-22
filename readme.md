@@ -18,6 +18,10 @@ A command-line application written in Rust that intelligently splits long audio 
 
 * **AI Chapter Matching (optional):** Give it the book's EPUB and a local Whisper speech-to-text model transcribes ~20 seconds either side of each silence. The app splits only where the narration matches the start of an EPUB chapter, and names the files after the chapters (e.g. `03 - The Storm.mp3`). In the GUI you can play 30 seconds from each matched break to check it by ear. Everything runs offline on your machine.
 
+* **Chapter Editor (GUI):** After analysis, rename, remove or add chapters, move a break to the previous or next silence, add one at any time (`h:mm:ss`), or promote a silence the analysis skipped. Every break can be played back to check it by ear.
+
+* **Metadata Editor (GUI):** Set the album, artist, album artist, genre and year for the whole book, and a track naming convention such as `{n} - {title}` (`{n}` counts from 00; `{album}` is also available). Every output file is tagged disc 1 with sequential track numbers across the whole book. Empty fields keep the source file's tags.
+
 * **Multi-file Processing:** Option to process multiple audio files consecutively.
 
 ## Prerequisites
