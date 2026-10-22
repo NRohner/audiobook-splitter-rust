@@ -1,11 +1,17 @@
 mod gui;
 
+use audiobook_splitter_rust::book::load_chapters;
+use audiobook_splitter_rust::chapters::{candidates, chapter_plan, pick_breaks, transcribe_candidates, AudioFile, SplitJob};
+use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
 use audiobook_splitter_rust::{collect_inputs, detect_silences, split_file, split_points};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 fn main() {
-    if std::env::args().any(|a| a == "--cli") {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--pick") {
+        gui::pick(args.get(i + 1).map_or("file", String::as_str));
+    } else if args.iter().any(|a| a == "--cli") {
         run_cli();
     } else {
         gui::run();
@@ -74,6 +80,21 @@ fn process_selection() {
         }
     };
 
+    // Optional EPUB: splits only where the transcript matches a chapter start.
+    let epub = loop {
+        let path = prompt("Optional: path to the book's EPUB to match chapters with AI (Enter to skip): ");
+        if path.is_empty() {
+            break None;
+        }
+        match load_chapters(&PathBuf::from(&path)).and_then(|ch| Ok((ch, find_model()?))) {
+            Ok((chapters, model)) => {
+                println!("Status: EPUB has {} chapters.", chapters.len());
+                break Some((chapters, model));
+            }
+            Err(e) => println!("Error: {} Please try again.", e),
+        }
+    };
+
     // Analysis loop: re-run with new settings until the user is happy.
     let plan = loop {
         let min_silence = loop {
@@ -92,23 +113,57 @@ fn process_selection() {
         println!("\nStatus: Detecting silences in {} file(s) with threshold {:.2}s and noise {}dB...", input_paths.len(), min_silence, noise_db);
         println!("(This might take a while for long audio files)");
 
-        let mut plan: Vec<(PathBuf, Vec<f64>)> = Vec::new();
+        let mut files: Vec<AudioFile> = Vec::new();
         for path in &input_paths {
             print!("  Analyzing '{}'...", path.display());
             io::stdout().flush().unwrap();
             match detect_silences(path, min_silence, noise_db) {
-                Ok((silences, total)) => {
-                    let points = split_points(&silences, min_silence, total);
-                    println!(" Identified {} segments.", points.len());
-                    if !points.is_empty() {
-                        plan.push((path.clone(), points));
-                    }
+                Ok((silences, duration)) => {
+                    println!(" Identified {} segments.", split_points(&silences, min_silence, duration).len());
+                    files.push(AudioFile { path: path.clone(), silences, duration });
                 }
                 Err(e) => eprintln!("\n  Error analyzing '{}': {}\n  (This file will be skipped.)", path.display(), e),
             }
         }
 
-        let total_segments: usize = plan.iter().map(|(_, p)| p.len()).sum();
+        let plan: Vec<SplitJob> = match &epub {
+            None => files
+                .iter()
+                .map(|f| SplitJob { path: f.path.clone(), points: split_points(&f.silences, min_silence, f.duration), names: None })
+                .filter(|job| !job.points.is_empty())
+                .collect(),
+            Some((chapters, model)) => {
+                let cands = candidates(&files, min_silence);
+                println!("\nStatus: Transcribing around {} candidate breaks...", cands.len());
+                let transcripts = Transcriber::load(model).and_then(|mut t| {
+                    transcribe_candidates(&files, &cands, &mut t, |done, total| {
+                        print!("\r  {}/{}", done, total);
+                        io::stdout().flush().unwrap();
+                    })
+                });
+                println!();
+                let transcripts = match transcripts {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        return;
+                    }
+                };
+                let m = pick_breaks(&cands, &transcripts, chapters, 0.4);
+                let title = |ch: usize| chapters[ch].title.clone().unwrap_or_else(|| format!("Section {}", ch + 1));
+                for b in &m.breaks {
+                    println!("  {} @ {:.1}s -> {} (score {:.2})", files[b.file].path.display(), b.at, title(b.chapter), b.score);
+                }
+                if !m.missing.is_empty() {
+                    let names: Vec<String> = m.missing.iter().map(|&ch| title(ch)).collect();
+                    println!("  No break found for: {}", names.join(", "));
+                }
+                println!("  Matched {} of {} chapters.", m.breaks.len(), chapters.len());
+                if m.breaks.is_empty() { Vec::new() } else { chapter_plan(&files, &m, chapters) }
+            }
+        };
+
+        let total_segments: usize = plan.iter().map(|job| job.points.len()).sum();
         if total_segments == 0 {
             println!("\nNo silences detected longer than the specified threshold across all files with current settings.");
             if prompt("Do you want to re-analyze with different settings? (y/n): ").eq_ignore_ascii_case("y") {
@@ -126,9 +181,9 @@ fn process_selection() {
         }
     };
 
-    for (path, points) in &plan {
+    for SplitJob { path, points, names } in &plan {
         println!("\n--- Splitting: {} ---", path.display());
-        let result = split_file(path, &output_dir, points, |part, total, out| {
+        let result = split_file(path, &output_dir, points, names.as_deref(), |part, total, out| {
             println!("  Status: Writing part {}/{} to '{}'...", part, total, out.display());
         });
         match result {

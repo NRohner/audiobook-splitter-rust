@@ -1,7 +1,11 @@
 // Local web GUI: a tiny HTTP server on 127.0.0.1 serving one embedded page.
-// Requests are handled on the main thread (macOS requires native file dialogs there);
+// Native file dialogs run in a child process (`--pick`), so this process never becomes
+// a Cocoa app whose unpumped event loop macOS would flag as not responding;
 // analysis and splitting run on a background thread and the page polls /status.
-use audiobook_splitter_rust::{collect_inputs, detect_silences, split_file, split_points, AUDIO_EXTENSIONS};
+use audiobook_splitter_rust::book::load_chapters;
+use audiobook_splitter_rust::chapters::{candidates, chapter_plan, pick_breaks, transcribe_candidates, AudioFile, SplitJob};
+use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
+use audiobook_splitter_rust::{collect_inputs, detect_silences, preview_clip, split_file, split_points, AUDIO_EXTENSIONS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -12,6 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 const PAGE: &str = include_str!("ui.html");
 const DEFAULT_PORT: u16 = 7878;
+const CLIP_SECONDS: f64 = 30.0;
 
 #[derive(Serialize, Clone)]
 struct FileRow {
@@ -20,16 +25,31 @@ struct FileRow {
     error: Option<String>,
 }
 
+#[derive(Serialize)]
+struct BreakRow {
+    file: String,
+    at: f64,
+    chapter: String,
+    score: f64,
+    before: String,
+    after: String,
+}
+
 #[derive(Serialize, Default)]
 struct Status {
     running: bool,
     phase: &'static str, // "analyze", "split" or "" before anything has run
+    stage: String,       // What the progress bar is counting right now.
     done: usize,
     total: usize,
     files: Vec<FileRow>,
+    breaks: Option<Vec<BreakRow>>, // Only when an EPUB was used.
+    missing: Vec<String>,          // EPUB chapters with no matching break.
     log: Vec<String>,
     #[serde(skip)]
-    plan: Vec<(PathBuf, Vec<f64>)>, // Split points from the last analysis.
+    plan: Vec<SplitJob>, // From the last analysis.
+    #[serde(skip)]
+    break_audio: Vec<(PathBuf, f64)>, // File and split time of each entry in `breaks`.
 }
 
 type Shared = Arc<Mutex<Status>>;
@@ -39,6 +59,14 @@ struct AnalyzeReq {
     input: String,
     min_silence: f64,
     noise_db: f64,
+    #[serde(default)]
+    epub: String,
+    #[serde(default = "default_threshold")]
+    threshold: f64,
+}
+
+fn default_threshold() -> f64 {
+    0.4
 }
 
 #[derive(Deserialize)]
@@ -48,7 +76,7 @@ struct SplitReq {
 
 #[derive(Deserialize)]
 struct BrowseReq {
-    kind: String, // "file" or "folder"
+    kind: String, // "file", "epub" or "folder"
 }
 
 pub fn run() {
@@ -95,14 +123,23 @@ fn handle(mut req: Request, state: &Shared, port: u16) {
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
 
-    let result = match (req.method(), req.url()) {
+    let url = req.url().to_string();
+    let (route, query) = url.split_once('?').unwrap_or((&url, ""));
+    let result = match (req.method(), route) {
         (Method::Get, "/") => {
             let html = Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
             let _ = req.respond(Response::from_string(PAGE).with_header(html));
             return;
         }
         (Method::Get, "/status") => Ok(serde_json::to_value(&*state.lock().unwrap()).unwrap()),
-        (Method::Post, "/browse") => parse(&body).map(browse),
+        (Method::Get, "/clip") => match clip(state, query) {
+            Ok(mp3) => {
+                respond_audio(req, mp3);
+                return;
+            }
+            Err(e) => Err(e),
+        },
+        (Method::Post, "/browse") => parse(&body).and_then(browse),
         (Method::Post, "/analyze") => parse(&body).and_then(|r| start_analyze(r, state)),
         (Method::Post, "/split") => parse(&body).and_then(|r| start_split(r, state)),
         _ => {
@@ -119,6 +156,35 @@ fn handle(mut req: Request, state: &Shared, port: u16) {
     let _ = req.respond(Response::from_string(value.to_string()).with_status_code(code).with_header(ct));
 }
 
+// Safari only plays <audio> from servers that honour Range requests.
+// ponytail: each range request re-cuts the clip; cache the last clip if that gets slow.
+fn respond_audio(req: Request, mp3: Vec<u8>) {
+    let len = mp3.len();
+    let range = byte_range(header(&req, "Range").as_deref(), len);
+    let (code, body) = match range {
+        Some((start, end)) => (206, mp3[start..=end].to_vec()),
+        None => (200, mp3),
+    };
+    let mut response = Response::from_data(body)
+        .with_status_code(code)
+        .with_header(Header::from_bytes("Content-Type", "audio/mpeg").unwrap())
+        .with_header(Header::from_bytes("Accept-Ranges", "bytes").unwrap());
+    if let Some((start, end)) = range {
+        let value = format!("bytes {}-{}/{}", start, end, len);
+        response = response.with_header(Header::from_bytes("Content-Range", value).unwrap());
+    }
+    let _ = req.respond(response);
+}
+
+// `bytes=start-[end]` as an inclusive range within `len` bytes; None means send everything.
+fn byte_range(header: Option<&str>, len: usize) -> Option<(usize, usize)> {
+    let (start, end) = header?.strip_prefix("bytes=")?.split_once('-')?;
+    let start: usize = start.parse().ok()?;
+    let last = len.checked_sub(1)?;
+    let end = if end.is_empty() { last } else { end.parse::<usize>().ok()?.min(last) };
+    (start <= end).then_some((start, end))
+}
+
 fn header(req: &Request, name: &'static str) -> Option<String> {
     req.headers()
         .iter()
@@ -130,14 +196,36 @@ fn parse<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T, String> {
     serde_json::from_str(body).map_err(|e| format!("Bad request: {}", e))
 }
 
-fn browse(req: BrowseReq) -> Value {
+fn browse(req: BrowseReq) -> Result<Value, String> {
+    let output = std::env::current_exe()
+        .and_then(|exe| Command::new(exe).args(["--pick", &req.kind]).output())
+        .map_err(|e| format!("Failed to open the file dialog: {}", e))?;
+    let path = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(json!({ "path": Some(path).filter(|p| !p.is_empty()) }))
+}
+
+// Runs in the `--pick` child process: shows one dialog and prints the chosen path.
+pub fn pick(kind: &str) {
     let dialog = rfd::FileDialog::new();
-    let picked = if req.kind == "file" {
-        dialog.add_filter("Audio", &AUDIO_EXTENSIONS).pick_file()
-    } else {
-        dialog.pick_folder()
+    let picked = match kind {
+        "file" => dialog.add_filter("Audio", &AUDIO_EXTENSIONS).pick_file(),
+        "epub" => dialog.add_filter("EPUB", &["epub"]).pick_file(),
+        _ => dialog.pick_folder(),
     };
-    json!({ "path": picked.map(|p| p.to_string_lossy().to_string()) })
+    if let Some(path) = picked {
+        print!("{}", path.to_string_lossy());
+    }
+}
+
+// `break=N`: CLIP_SECONDS of audio from the middle of break N's silence. Takes an
+// index rather than a path so the page can only play files from the analysis.
+fn clip(state: &Shared, query: &str) -> Result<Vec<u8>, String> {
+    let (path, at) = query
+        .strip_prefix("break=")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|n| state.lock().unwrap().break_audio.get(n).cloned())
+        .ok_or("Unknown chapter break. Analyze again.")?;
+    preview_clip(&path, at, CLIP_SECONDS)
 }
 
 fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
@@ -147,10 +235,18 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
     if !req.noise_db.is_finite() {
         return Err("Noise threshold must be a number.".into());
     }
+    if !(0.0..=1.0).contains(&req.threshold) {
+        return Err("Match threshold must be between 0 and 1.".into());
+    }
     let inputs = collect_inputs(&PathBuf::from(req.input.trim()))?;
     if inputs.is_empty() {
         return Err("No supported audio files found in that folder.".into());
     }
+    // Fail fast on a bad EPUB or missing model, before any slow work starts.
+    let epub = match req.epub.trim() {
+        "" => None,
+        path => Some((load_chapters(&PathBuf::from(path))?, find_model()?)),
+    };
 
     {
         let mut s = state.lock().unwrap();
@@ -160,26 +256,33 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
         *s = Status {
             running: true,
             phase: "analyze",
+            stage: "Detecting silences".into(),
             total: inputs.len(),
             files: inputs.iter().map(|p| FileRow { name: file_name(p), segments: None, error: None }).collect(),
             ..Default::default()
         };
         s.log.push(format!("Analyzing {} file(s): min silence {}s, noise {}dB", inputs.len(), req.min_silence, req.noise_db));
+        if let Some((chapters, _)) = &epub {
+            s.log.push(format!("EPUB: {} chapters", chapters.len()));
+        }
     }
 
     let state = state.clone();
     thread::spawn(move || {
+        let mut files = Vec::new();
         for (i, path) in inputs.iter().enumerate() {
-            let result = detect_silences(path, req.min_silence, req.noise_db)
-                .map(|(silences, total)| split_points(&silences, req.min_silence, total));
+            let result = detect_silences(path, req.min_silence, req.noise_db);
             let mut s = state.lock().unwrap();
             match result {
-                Ok(points) => {
-                    s.files[i].segments = Some(points.len());
-                    s.log.push(format!("{}: {} segments", file_name(path), points.len()));
-                    if !points.is_empty() {
-                        s.plan.push((path.clone(), points));
+                Ok((silences, duration)) => {
+                    let count = split_points(&silences, req.min_silence, duration).len();
+                    if epub.is_none() {
+                        s.files[i].segments = Some(count);
+                        s.log.push(format!("{}: {} segments", file_name(path), count));
+                    } else {
+                        s.log.push(format!("{}: {} candidate silences", file_name(path), count.saturating_sub(1)));
                     }
+                    files.push(AudioFile { path: path.clone(), silences, duration });
                 }
                 Err(e) => {
                     s.files[i].error = Some(e.clone());
@@ -188,11 +291,81 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
             }
             s.done = i + 1;
         }
+
+        let result = match &epub {
+            None => Ok(files
+                .iter()
+                .map(|f| SplitJob {
+                    path: f.path.clone(),
+                    points: split_points(&f.silences, req.min_silence, f.duration),
+                    names: None,
+                })
+                .filter(|job| !job.points.is_empty())
+                .collect()),
+            Some((chapters, model)) => match_with_epub(&files, chapters, model, &req, &state),
+        };
+
         let mut s = state.lock().unwrap();
+        match result {
+            Ok(plan) => {
+                s.plan = plan;
+                s.log.push("Analysis complete.".into());
+            }
+            Err(e) => s.log.push(format!("Error: {}", e)),
+        }
         s.running = false;
-        s.log.push("Analysis complete.".into());
     });
     Ok(json!({}))
+}
+
+// Transcribes around each candidate silence and matches it to the EPUB's chapters.
+fn match_with_epub(
+    files: &[AudioFile],
+    chapters: &[audiobook_splitter_rust::book::Chapter],
+    model: &std::path::Path,
+    req: &AnalyzeReq,
+    state: &Shared,
+) -> Result<Vec<SplitJob>, String> {
+    let cands = candidates(files, req.min_silence);
+    {
+        let mut s = state.lock().unwrap();
+        s.stage = "Transcribing around silences".into();
+        s.done = 0;
+        s.total = cands.len();
+        s.log.push(format!("Transcribing {} candidate breaks with Whisper...", cands.len()));
+    }
+    let mut transcriber = Transcriber::load(model)?;
+    let transcripts = transcribe_candidates(files, &cands, &mut transcriber, |done, _| {
+        state.lock().unwrap().done = done;
+    })?;
+
+    let m = pick_breaks(&cands, &transcripts, chapters, req.threshold);
+    let plan = chapter_plan(files, &m, chapters);
+    let title = |ch: usize| chapters[ch].title.clone().unwrap_or_else(|| format!("Section {}", ch + 1));
+
+    let mut s = state.lock().unwrap();
+    for (i, f) in files.iter().enumerate() {
+        if let Some(row) = s.files.iter_mut().find(|r| r.name == file_name(&f.path)) {
+            row.segments = Some(plan[i].points.len());
+        }
+    }
+    s.breaks = Some(
+        m.breaks
+            .iter()
+            .map(|b| BreakRow {
+                file: file_name(&files[b.file].path),
+                at: b.at,
+                chapter: title(b.chapter),
+                score: b.score,
+                before: b.before.clone(),
+                after: b.after.clone(),
+            })
+            .collect(),
+    );
+    s.break_audio = m.breaks.iter().map(|b| (files[b.file].path.clone(), b.at)).collect();
+    s.missing = m.missing.iter().map(|&ch| title(ch)).collect();
+    s.log.push(format!("Matched {} of {} chapters.", m.breaks.len(), chapters.len()));
+    Ok(plan)
 }
 
 fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
@@ -216,24 +389,25 @@ fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
             .map_err(|e| format!("Failed to create '{}': {}", output.display(), e))?;
         s.running = true;
         s.phase = "split";
+        s.stage = "Writing files".into();
         s.done = 0;
-        s.total = s.plan.iter().map(|(_, p)| p.len()).sum();
+        s.total = s.plan.iter().map(|job| job.points.len()).sum();
         s.log.push(format!("Splitting into {}", output.display()));
         std::mem::take(&mut s.plan)
     };
 
     let state = state.clone();
     thread::spawn(move || {
-        for (path, points) in &plan {
-            let result = split_file(path, &output, points, |_, _, out| {
+        for job in &plan {
+            let result = split_file(&job.path, &output, &job.points, job.names.as_deref(), |_, _, out| {
                 let mut s = state.lock().unwrap();
                 s.done += 1;
                 s.log.push(format!("Writing {}", file_name(out)));
             });
             let mut s = state.lock().unwrap();
             match result {
-                Ok(n) => s.log.push(format!("{}: wrote {} file(s)", file_name(path), n)),
-                Err(e) => s.log.push(format!("{}: {}", file_name(path), e)),
+                Ok(n) => s.log.push(format!("{}: wrote {} file(s)", file_name(&job.path), n)),
+                Err(e) => s.log.push(format!("{}: {}", file_name(&job.path), e)),
             }
         }
         let mut s = state.lock().unwrap();
@@ -246,4 +420,29 @@ fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
 
 fn file_name(path: &std::path::Path) -> String {
     path.file_name().unwrap_or_default().to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_rejects_unknown_breaks() {
+        let state: Shared = Arc::default();
+        assert!(clip(&state, "break=0").is_err());
+        assert!(clip(&state, "break=x").is_err());
+        assert!(clip(&state, "").is_err());
+    }
+
+    #[test]
+    fn byte_range_parses_requests() {
+        assert_eq!(byte_range(None, 100), None);
+        assert_eq!(byte_range(Some("bytes=0-1"), 100), Some((0, 1)));
+        assert_eq!(byte_range(Some("bytes=10-"), 100), Some((10, 99)));
+        assert_eq!(byte_range(Some("bytes=50-500"), 100), Some((50, 99)));
+        assert_eq!(byte_range(Some("bytes=100-"), 100), None);
+        assert_eq!(byte_range(Some("bytes=9-3"), 100), None);
+        assert_eq!(byte_range(Some("junk"), 100), None);
+        assert_eq!(byte_range(Some("bytes=0-"), 0), None);
+    }
 }

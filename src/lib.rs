@@ -1,9 +1,13 @@
 // Core audio-splitting logic shared by the CLI and the GUI.
+pub mod book;
+pub mod chapters;
+pub mod matching;
+pub mod transcribe;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const AUDIO_EXTENSIONS: [&str; 6] = ["mp3", "wav", "flac", "aac", "m4a", "ogg"];
+pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "m4b", "wav", "flac", "aac", "m4a", "ogg"];
 
 // A detected silence region, in seconds.
 #[derive(Debug, PartialEq)]
@@ -139,17 +143,35 @@ pub fn detect_silences(
     Ok((parse_silencedetect(&log), total_duration))
 }
 
+// Decodes `seconds` of `input` from `start` into MP3 bytes, playable in any browser.
+pub fn preview_clip(input: &Path, start: f64, seconds: f64) -> Result<Vec<u8>, String> {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-ss", &start.to_string(), "-i"])
+        .arg(input)
+        .args(["-t", &seconds.to_string(), "-vn", "-f", "mp3", "pipe:1"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("FFmpeg failed to cut a preview:\n{}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output.stdout)
+}
+
 // Writes one `<stem>_NNN.<ext>` file per segment into `out_dir`.
+// Uses `names[i]` for segment i when given (never overwriting an existing file).
 // `on_part(part, total, path)` is called before each part is written. Returns the number of files written.
 pub fn split_file(
     input: &Path,
     out_dir: &Path,
     points: &[f64],
+    names: Option<&[String]>,
     mut on_part: impl FnMut(usize, usize, &Path),
 ) -> Result<usize, String> {
     let ext = input.extension().unwrap_or_default().to_string_lossy().to_string();
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("audio_part");
     let mut index = next_file_index(out_dir, stem, &ext)?;
+    let no_video = ["m4b", "m4a"].contains(&ext.to_lowercase().as_str());
     let mut start = 0.0;
     let mut written = 0;
 
@@ -159,18 +181,29 @@ pub fn split_file(
             start = end;
             continue;
         }
-        let out_path = out_dir.join(format!("{}_{:03}.{}", stem, index, ext));
+        let out_path = match names.and_then(|n| n.get(i)) {
+            Some(name) => unique_path(out_dir, name, &ext),
+            None => out_dir.join(format!("{}_{:03}.{}", stem, index, ext)),
+        };
         on_part(i + 1, points.len(), &out_path);
 
-        let output = Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-i"])
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(input)
-            .args(["-ss", &start.to_string(), "-t", &duration.to_string(), "-c", "copy", "-y"])
+            .args(["-ss", &start.to_string(), "-t", &duration.to_string(), "-c", "copy"]);
+        // ponytail: drops cover art from M4B/M4A parts; the ipod muxer rejects cover
+        // tracks stored as MJPEG video. Re-attach covers with a remux if anyone misses them.
+        if no_video {
+            cmd.arg("-vn");
+        }
+        let output = cmd
+            .arg("-y")
             .arg(&out_path)
             .stdin(Stdio::null())
             .output()
             .map_err(|e| format!("Failed to run ffmpeg for splitting: {}", e))?;
         if !output.status.success() {
+            let _ = std::fs::remove_file(&out_path); // Don't leave a broken part behind.
             return Err(format!(
                 "FFmpeg failed on part {}:\n{}",
                 i + 1,
@@ -183,6 +216,17 @@ pub fn split_file(
         written += 1;
     }
     Ok(written)
+}
+
+// `<dir>/<name>.<ext>`, or `<name> (2).<ext>` etc. if that already exists.
+pub fn unique_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
+    let mut path = dir.join(format!("{}.{}", name, ext));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{} ({}).{}", name, n, ext));
+        n += 1;
+    }
+    path
 }
 
 #[cfg(test)]
@@ -245,9 +289,41 @@ size=N/A time=00:00:10.00
     }
 
     #[test]
+    fn preview_clip_returns_mp3() {
+        let dir = temp_dir("clip");
+        let wav = dir.join("tone.wav");
+        let made = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=d=5", "-y"])
+            .arg(&wav)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let mp3 = preview_clip(&wav, 1.0, 2.0).unwrap();
+        assert!(mp3.starts_with(b"ID3"), "not an MP3");
+        assert!(preview_clip(&dir.join("missing.wav"), 0.0, 2.0).is_err());
+    }
+
+    #[test]
+    fn split_file_handles_m4b_with_cover_art() {
+        // Cover as an MJPEG video track (Audible-style "timed thumbnail"), which the
+        // ipod muxer behind .m4b/.m4a can't store.
+        let dir = temp_dir("m4b");
+        let ffmpeg = |args: &[&str]| {
+            let ok = Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y"]).args(args).current_dir(&dir).status();
+            assert!(ok.unwrap().success());
+        };
+        ffmpeg(&["-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", "cover.jpg"]);
+        ffmpeg(&["-f", "lavfi", "-i", "sine=d=6", "-i", "cover.jpg", "-map", "0", "-map", "1", "-c:a", "aac",
+            "-c:v", "copy", "-f", "mp4", "book.m4b"]);
+        let out = dir.join("out");
+        fs::create_dir(&out).unwrap();
+        assert_eq!(split_file(&dir.join("book.m4b"), &out, &[3.0, 6.0], None, |_, _, _| {}), Ok(2));
+    }
+
+    #[test]
     fn scan_folder_filters_and_sorts() {
         let dir = temp_dir("scan");
-        for name in ["b.MP3", "a.wav", "notes.txt", "c.flac"] {
+        for name in ["b.MP3", "a.wav", "notes.txt", "c.flac", "d.m4b"] {
             fs::write(dir.join(name), b"").unwrap();
         }
         fs::create_dir(dir.join("sub.mp3")).unwrap();
@@ -256,7 +332,7 @@ size=N/A time=00:00:10.00
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert_eq!(names, vec!["a.wav", "b.MP3", "c.flac"]);
+        assert_eq!(names, vec!["a.wav", "b.MP3", "c.flac", "d.m4b"]);
     }
 
     #[test]
@@ -267,6 +343,15 @@ size=N/A time=00:00:10.00
         assert_eq!(collect_inputs(&file).unwrap(), vec![file.clone()]);
         assert_eq!(collect_inputs(&dir).unwrap(), vec![file]);
         assert!(collect_inputs(&dir.join("nope")).is_err());
+    }
+
+    #[test]
+    fn unique_path_never_reuses_existing_names() {
+        let dir = temp_dir("unique");
+        assert_eq!(unique_path(&dir, "01 - One", "mp3"), dir.join("01 - One.mp3"));
+        fs::write(dir.join("01 - One.mp3"), b"").unwrap();
+        fs::write(dir.join("01 - One (2).mp3"), b"").unwrap();
+        assert_eq!(unique_path(&dir, "01 - One", "mp3"), dir.join("01 - One (3).mp3"));
     }
 
     #[test]

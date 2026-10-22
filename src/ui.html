@@ -27,8 +27,15 @@
   .field { margin-bottom: 16px; }
   .field:last-child { margin-bottom: 0; }
   .row { display: flex; gap: 8px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } .row { flex-wrap: wrap; } }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; }
+  .opt { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 4px; }
+  .missing { color: var(--err); font-size: 13px; margin: 12px 0 0; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  details p { margin: 6px 0 0; font-size: 13px; }
+  details b { font-weight: 600; color: var(--muted); }
+  .chapter-name { font-weight: 600; }
+  .where { color: var(--muted); font-size: 13px; }
+  @media (max-width: 560px) { .row { flex-wrap: wrap; } }
   input { flex: 1; min-width: 0; width: 100%; padding: 9px 11px; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 7px; }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
@@ -47,6 +54,8 @@
   th { font-size: 13px; color: var(--muted); font-weight: 600; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; width: 90px; }
   td.bad { color: var(--err); font-size: 13px; }
+  td.play { width: 44px; }
+  button.icon { padding: 7px; }
   pre { margin: 14px 0 0; padding: 12px; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
   [hidden] { display: none !important; }
 </style>
@@ -64,10 +73,18 @@
     <div class="field">
       <label for="input">Audio file or folder</label>
       <div class="row">
-        <input id="input" placeholder="/path/to/book.mp3 or /path/to/folder" spellcheck="false">
+        <input id="input" placeholder="/path/to/book.mp3, book.m4b or /path/to/folder" spellcheck="false">
         <button type="button" data-browse="file" data-target="input"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>File</button>
         <button type="button" data-browse="folder" data-target="input"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Folder</button>
       </div>
+    </div>
+    <div class="field">
+      <label for="epub">Book EPUB <span class="opt">optional</span></label>
+      <div class="row">
+        <input id="epub" placeholder="/path/to/book.epub" spellcheck="false">
+        <button type="button" data-browse="epub" data-target="epub"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/></svg>Browse</button>
+      </div>
+      <div class="hint">When set, a local speech-to-text model listens around each silence and the app splits only where the narration matches the start of an EPUB chapter. Files are named after the chapters.</div>
     </div>
     <div class="field">
       <label for="output">Output folder</label>
@@ -92,6 +109,11 @@
         <input id="noise_db" type="number" step="1" value="-40">
         <div class="hint">Less negative values treat more sound as silence.</div>
       </div>
+      <div class="field">
+        <label for="threshold">Chapter match threshold</label>
+        <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.4">
+        <div class="hint">EPUB only. How closely the narration must match a chapter opening (0 to 1).</div>
+      </div>
     </div>
   </section>
 
@@ -105,7 +127,12 @@
     <h2 id="results-title">Results</h2>
     <div class="progress" role="progressbar" aria-label="Progress"><div id="bar"></div></div>
     <div id="status-line" class="status-line"></div>
-    <table>
+    <table id="breaks-table" hidden>
+      <thead><tr><th><span class="opt" style="margin:0">Listen</span></th><th>Chapter break</th><th style="text-align:right">Score</th></tr></thead>
+      <tbody id="break-rows"></tbody>
+    </table>
+    <p id="missing" class="missing" hidden></p>
+    <table id="files-table">
       <thead><tr><th>File</th><th style="text-align:right">Segments</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
@@ -115,7 +142,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const fields = ['input', 'output', 'min_silence', 'noise_db'];
+const fields = ['input', 'epub', 'output', 'min_silence', 'noise_db', 'threshold'];
 let analyzedKey = null; // settings used by the last analysis
 let polling = false;
 
@@ -128,7 +155,7 @@ for (const f of fields) {
   });
 }
 
-const settingsKey = () => JSON.stringify([$('input').value.trim(), $('min_silence').value, $('noise_db').value]);
+const settingsKey = () => JSON.stringify(['input', 'epub', 'min_silence', 'noise_db', 'threshold'].map(f => $(f).value.trim()));
 
 async function api(path, body) {
   const res = await fetch(path, body === undefined ? {} : {
@@ -155,6 +182,8 @@ $('analyze').addEventListener('click', async () => {
       input: $('input').value,
       min_silence: parseFloat($('min_silence').value),
       noise_db: parseFloat($('noise_db').value),
+      epub: $('epub').value,
+      threshold: parseFloat($('threshold').value),
     });
     analyzedKey = settingsKey();
     poll();
@@ -167,7 +196,42 @@ $('split').addEventListener('click', async () => {
   catch (e) { showError(e); }
 });
 
+// One shared player; `playing` is the break index being played, or null.
+const player = new Audio();
+let playing = null;
+const PLAY_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg>';
+const STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
+function setPlaying(i) {
+  playing = i;
+  document.querySelectorAll('[data-break]').forEach(btn => {
+    const on = Number(btn.dataset.break) === playing;
+    btn.innerHTML = on ? STOP_ICON : PLAY_ICON;
+    btn.setAttribute('aria-label', (on ? 'Stop ' : 'Play ') + btn.dataset.chapter);
+  });
+}
+function togglePlay(i) {
+  showError();
+  if (playing === i) { player.pause(); setPlaying(null); return; }
+  // Called straight from the click so Safari allows playback.
+  player.src = '/clip?break=' + i;
+  player.play().catch(() => {});
+  setPlaying(i);
+}
+player.addEventListener('ended', () => setPlaying(null));
+player.addEventListener('error', () => {
+  if (playing === null) return;
+  setPlaying(null);
+  showError(new Error('Could not play that clip. Try analyzing again.'));
+});
+
 let lastStatus = null;
+const clock = t => { t = Math.round(t); const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, sec = String(t % 60).padStart(2, '0'); return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`; };
+function transcriptLine(label, text) {
+  const p = document.createElement('p');
+  const b = document.createElement('b'); b.textContent = label + ': ';
+  p.append(b, text || '(start of file)');
+  return p;
+}
 function render(s) {
   if (!s) return;
   const segments = s.files.reduce((n, f) => n + (f.segments || 0), 0);
@@ -180,9 +244,34 @@ function render(s) {
   $('results-title').textContent = s.phase === 'split' ? 'Splitting' : 'Analysis';
   $('bar').style.width = (s.total ? 100 * s.done / s.total : 0) + '%';
   $('status-line').textContent = s.running
-    ? (s.phase === 'split' ? `Writing part ${s.done} of ${s.total}` : `Analyzing file ${Math.min(s.done + 1, s.total)} of ${s.total}`)
+    ? `${s.stage}: ${Math.min(s.done + (s.phase === 'split' ? 0 : 1), s.total)} of ${s.total}`
     : (s.phase === 'split' ? `Finished. ${s.total} segment(s) written.` : `${segments} segment(s) across ${s.files.length} file(s).`
        + (analyzedKey !== settingsKey() ? ' Settings changed, analyze again to split.' : ''));
+
+  $('breaks-table').hidden = !s.breaks;
+  if (!s.breaks && playing !== null) { player.pause(); playing = null; }
+  $('break-rows').replaceChildren(...(s.breaks || []).map((b, i) => {
+    const tr = document.createElement('tr');
+    const play = document.createElement('td'); play.className = 'play';
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'icon'; btn.dataset.break = i; btn.dataset.chapter = b.chapter;
+    btn.title = 'Play 30 seconds from the middle of the silence';
+    btn.addEventListener('click', () => togglePlay(i));
+    play.append(btn);
+    const main = document.createElement('td');
+    const name = document.createElement('div'); name.className = 'chapter-name'; name.textContent = b.chapter;
+    const where = document.createElement('div'); where.className = 'where'; where.textContent = `${b.file} at ${clock(b.at)}`;
+    const details = document.createElement('details');
+    const summary = document.createElement('summary'); summary.textContent = 'What was heard';
+    details.append(summary, transcriptLine('Before', b.before), transcriptLine('After', b.after));
+    main.append(name, where, details);
+    const score = document.createElement('td'); score.className = 'num'; score.textContent = b.score.toFixed(2);
+    tr.append(play, main, score);
+    return tr;
+  }));
+  setPlaying(playing);
+  $('missing').hidden = !s.missing.length;
+  $('missing').textContent = `No break found for: ${s.missing.join(', ')}. Front matter is usually not narrated; for real chapters try a shorter minimum silence or a lower match threshold.`;
 
   $('rows').replaceChildren(...s.files.map(f => {
     const tr = document.createElement('tr');
