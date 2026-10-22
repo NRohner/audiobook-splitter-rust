@@ -1,5 +1,6 @@
 // Local web GUI: a tiny HTTP server on 127.0.0.1 serving one embedded page.
-// Requests are handled on the main thread (macOS requires native file dialogs there);
+// Native file dialogs run in a child process (`--pick`), so this process never becomes
+// a Cocoa app whose unpumped event loop macOS would flag as not responding;
 // analysis and splitting run on a background thread and the page polls /status.
 use audiobook_splitter_rust::book::load_chapters;
 use audiobook_splitter_rust::chapters::{candidates, chapter_plan, pick_breaks, transcribe_candidates, AudioFile, SplitJob};
@@ -126,7 +127,7 @@ fn handle(mut req: Request, state: &Shared, port: u16) {
             return;
         }
         (Method::Get, "/status") => Ok(serde_json::to_value(&*state.lock().unwrap()).unwrap()),
-        (Method::Post, "/browse") => parse(&body).map(browse),
+        (Method::Post, "/browse") => parse(&body).and_then(browse),
         (Method::Post, "/analyze") => parse(&body).and_then(|r| start_analyze(r, state)),
         (Method::Post, "/split") => parse(&body).and_then(|r| start_split(r, state)),
         _ => {
@@ -154,14 +155,25 @@ fn parse<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T, String> {
     serde_json::from_str(body).map_err(|e| format!("Bad request: {}", e))
 }
 
-fn browse(req: BrowseReq) -> Value {
+fn browse(req: BrowseReq) -> Result<Value, String> {
+    let output = std::env::current_exe()
+        .and_then(|exe| Command::new(exe).args(["--pick", &req.kind]).output())
+        .map_err(|e| format!("Failed to open the file dialog: {}", e))?;
+    let path = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(json!({ "path": Some(path).filter(|p| !p.is_empty()) }))
+}
+
+// Runs in the `--pick` child process: shows one dialog and prints the chosen path.
+pub fn pick(kind: &str) {
     let dialog = rfd::FileDialog::new();
-    let picked = match req.kind.as_str() {
+    let picked = match kind {
         "file" => dialog.add_filter("Audio", &AUDIO_EXTENSIONS).pick_file(),
         "epub" => dialog.add_filter("EPUB", &["epub"]).pick_file(),
         _ => dialog.pick_folder(),
     };
-    json!({ "path": picked.map(|p| p.to_string_lossy().to_string()) })
+    if let Some(path) = picked {
+        print!("{}", path.to_string_lossy());
+    }
 }
 
 fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {

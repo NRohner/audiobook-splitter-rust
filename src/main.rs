@@ -8,7 +8,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 fn main() {
-    if std::env::args().any(|a| a == "--cli") {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--pick") {
+        gui::pick(args.get(i + 1).map_or("file", String::as_str));
+    } else if args.iter().any(|a| a == "--cli") {
         run_cli();
     } else {
         gui::run();
