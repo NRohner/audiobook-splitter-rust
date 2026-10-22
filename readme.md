@@ -67,10 +67,11 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
 
 1.  **Install Rust:** download and run `rustup-init.exe` from <https://www.rust-lang.org/tools/install>. When asked, let it install the **Visual Studio C++ Build Tools** (the "Desktop development with C++" workload); that is the C/C++ compiler.
 
-2.  **Install CMake and Git:**
+2.  **Install CMake, Git and LLVM** (LLVM provides `libclang.dll`, which the Whisper bindings need at build time):
 
     ```powershell
-    winget install Kitware.CMake Git.Git
+    winget install Kitware.CMake Git.Git LLVM.LLVM
+    [Environment]::SetEnvironmentVariable("LIBCLANG_PATH", "C:\Program Files\LLVM\bin", "User")
     ```
 
 3.  **Install FFmpeg and FFprobe.** The quickest way is winget, which also adds them to your `PATH`:
@@ -94,6 +95,7 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
     ```powershell
     cargo --version
     cmake --version
+    Test-Path "$env:LIBCLANG_PATH\libclang.dll"   # should print True
     ffmpeg -version
     ffprobe -version
     ```
