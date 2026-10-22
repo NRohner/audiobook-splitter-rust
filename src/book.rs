@@ -131,17 +131,18 @@ fn toc_entries<R: std::io::Read + std::io::Seek>(doc: &mut epub::doc::EpubDoc<R>
 }
 
 // Resolves "." and ".." so TOC links and spine paths compare equal.
+// Joins with '/' on every platform: zip entry names use '/', and PathBuf::push would use '\' on Windows.
 // ponytail: no %-decoding of hrefs; add it if a book with spaces in file names shows up.
 fn clean_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
+    let mut parts: Vec<String> = Vec::new();
     for c in path.components() {
         match c {
-            Component::ParentDir => { out.pop(); }
-            Component::CurDir => {}
-            other => out.push(other),
+            Component::ParentDir => { parts.pop(); }
+            Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            _ => {}
         }
     }
-    out
+    PathBuf::from(parts.join("/"))
 }
 
 // Byte offset of the tag carrying `id="<id>"`.
