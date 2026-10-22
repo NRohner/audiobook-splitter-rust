@@ -58,7 +58,7 @@ You need four things on any platform:
     ```bash
     git clone https://github.com/NRohner/audiobook-splitter.git
     cd audiobook-splitter
-    make dev     # downloads the Whisper model on first run, then opens the GUI
+    make run     # downloads the Whisper model on first run, builds the release binary, opens the GUI
     ```
 
 On Apple Silicon, Whisper runs on the GPU via Metal.
@@ -105,7 +105,7 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
     cd audiobook-splitter
     mkdir models
     curl.exe -L --fail -o models\ggml-base.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-    cargo run    # debug build, opens the GUI
+    cargo run --release   # builds the release binary, opens the GUI
     ```
 
     Use `curl.exe`, not `curl`: in Windows PowerShell 5, `curl` is an alias for `Invoke-WebRequest`, which takes different arguments.
