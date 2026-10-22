@@ -7,7 +7,7 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const AUDIO_EXTENSIONS: [&str; 6] = ["mp3", "wav", "flac", "aac", "m4a", "ogg"];
+pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "m4b", "wav", "flac", "aac", "m4a", "ogg"];
 
 // A detected silence region, in seconds.
 #[derive(Debug, PartialEq)]
@@ -267,7 +267,7 @@ size=N/A time=00:00:10.00
     #[test]
     fn scan_folder_filters_and_sorts() {
         let dir = temp_dir("scan");
-        for name in ["b.MP3", "a.wav", "notes.txt", "c.flac"] {
+        for name in ["b.MP3", "a.wav", "notes.txt", "c.flac", "d.m4b"] {
             fs::write(dir.join(name), b"").unwrap();
         }
         fs::create_dir(dir.join("sub.mp3")).unwrap();
@@ -276,7 +276,7 @@ size=N/A time=00:00:10.00
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert_eq!(names, vec!["a.wav", "b.MP3", "c.flac"]);
+        assert_eq!(names, vec!["a.wav", "b.MP3", "c.flac", "d.m4b"]);
     }
 
     #[test]
