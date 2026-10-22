@@ -6,6 +6,9 @@ use crate::transcribe::{clip_samples, Transcriber};
 use crate::Silence;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 // ponytail: fixed clip length (spec said 15-30s); make it a setting if tuning needs it.
 pub const CLIP_SECONDS: f64 = 20.0;
@@ -72,27 +75,45 @@ pub fn candidates(files: &[AudioFile], min_silence: f64) -> Vec<Candidate> {
 }
 
 // Transcribes the speech before and after each candidate. Returns (before, after) text.
+// Workers decode clips with FFmpeg while others hold the transcriber's states, so
+// Whisper rarely waits on decoding; each worker holds at most one candidate's clips.
 pub fn transcribe_candidates(
     files: &[AudioFile],
     cands: &[Candidate],
-    transcriber: &mut Transcriber,
+    transcriber: &Transcriber,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Vec<(String, String)>, String> {
-    let mut clip = |file: &AudioFile, from: f64, to: f64| -> Result<String, String> {
+    let clip = |file: &AudioFile, from: f64, to: f64| -> Result<String, String> {
         if to - from < 0.5 {
             return Ok(String::new());
         }
         transcriber.transcribe(&clip_samples(&file.path, from, to - from)?)
     };
-    let mut out = Vec::new();
-    for (i, c) in cands.iter().enumerate() {
-        let file = &files[c.file];
-        let before = clip(file, (c.start - CLIP_SECONDS).max(0.0), c.start)?;
-        let after = clip(file, c.end, (c.end + CLIP_SECONDS).min(file.duration))?;
-        out.push((before, after));
-        progress(i + 1, cands.len());
-    }
-    Ok(out)
+    let next = AtomicUsize::new(0);
+    thread::scope(|s| {
+        let (tx, rx) = mpsc::channel();
+        // ponytail: two decoders per state; tune if benchmarks show Whisper still waiting.
+        for _ in 0..transcriber.states() + 2 {
+            let (tx, clip, next) = (tx.clone(), &clip, &next);
+            s.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(c) = cands.get(i) else { break };
+                let file = &files[c.file];
+                let pair = clip(file, (c.start - CLIP_SECONDS).max(0.0), c.start)
+                    .and_then(|before| Ok((before, clip(file, c.end, (c.end + CLIP_SECONDS).min(file.duration))?)));
+                if tx.send((i, pair)).is_err() {
+                    break; // Another candidate failed.
+                }
+            });
+        }
+        drop(tx);
+        let mut out = vec![(String::new(), String::new()); cands.len()];
+        for (done, (i, pair)) in rx.iter().enumerate() {
+            out[i] = pair?; // Returning drops `rx`, which stops the workers.
+            progress(done + 1, cands.len());
+        }
+        Ok(out)
+    })
 }
 
 // The part of a chapter a clip of `n` words should line up with: barely more than

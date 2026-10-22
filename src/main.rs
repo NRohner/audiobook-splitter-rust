@@ -136,8 +136,8 @@ fn process_selection() {
             Some((chapters, model, _)) => {
                 let cands = candidates(&files, min_silence);
                 println!("\nStatus: Transcribing around {} candidate breaks...", cands.len());
-                let transcripts = Transcriber::load(model).and_then(|mut t| {
-                    transcribe_candidates(&files, &cands, &mut t, |done, total| {
+                let transcripts = Transcriber::load(model).and_then(|t| {
+                    transcribe_candidates(&files, &cands, &t, |done, total| {
                         print!("\r  {}/{}", done, total);
                         io::stdout().flush().unwrap();
                     })

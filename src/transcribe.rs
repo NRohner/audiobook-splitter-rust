@@ -1,6 +1,7 @@
 // Local speech-to-text with Whisper (whisper.cpp: Metal GPU on macOS, Vulkan GPU on Windows).
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Condvar, Mutex};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
 pub const MODEL_FILE: &str = "ggml-base.en.bin";
@@ -25,8 +26,30 @@ pub fn find_model() -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Whisper model '{}' not found. Download it into models/ (`make model`, or see the README on Windows).", MODEL_FILE))
 }
 
+// On an M3 Pro (Metal), 3 transcribed a book 8% faster than 2 (39 s vs 42 s; one at a time took 78 s).
+const GPU_STATES: usize = 3;
+
+// Whether ggml found a GPU at runtime. A GPU build with no usable device (e.g. Vulkan
+// without a driver) lists only the CPU, so it's treated like a CPU-only build.
+fn gpu_found() -> bool {
+    use whisper_rs_sys::*;
+    // SAFETY: read-only queries of ggml's static device registry, indices in range.
+    (0..unsafe { ggml_backend_dev_count() }).any(|i| {
+        let kind = unsafe { ggml_backend_dev_type(ggml_backend_dev_get(i)) };
+        kind == ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+            || kind == ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+    })
+}
+
+// Up to `states` transcriptions share one loaded model, so a GPU can run them side by
+// side. A CPU build runs one: Whisper already uses several cores per transcription.
+// Each clip gets a fresh state: a reused one carries over enough from earlier clips to
+// change a word now and then, which would make results depend on clip order.
 pub struct Transcriber {
-    state: WhisperState,
+    ctx: WhisperContext,
+    running: Mutex<usize>,
+    finished: Condvar,
+    states: usize,
 }
 
 impl Transcriber {
@@ -35,15 +58,33 @@ impl Transcriber {
         let model_str = model.to_str().ok_or("Model path is not valid UTF-8")?;
         let ctx = WhisperContext::new_with_params(model_str, WhisperContextParameters::default())
             .map_err(|e| format!("Failed to load Whisper model '{}': {}", model.display(), e))?;
-        let state = ctx.create_state().map_err(|e| format!("Failed to init Whisper: {}", e))?;
-        Ok(Self { state })
+        let states = if gpu_found() { GPU_STATES } else { 1 };
+        Ok(Self { ctx, running: Mutex::new(0), finished: Condvar::new(), states })
     }
 
-    // Transcribes 16 kHz mono samples.
-    pub fn transcribe(&mut self, samples: &[f32]) -> Result<String, String> {
+    // How many transcriptions can run at once.
+    pub fn states(&self) -> usize {
+        self.states
+    }
+
+    // Transcribes 16 kHz mono samples. Safe to call from several threads; waits while
+    // `states` transcriptions are already running.
+    pub fn transcribe(&self, samples: &[f32]) -> Result<String, String> {
         if samples.is_empty() {
             return Ok(String::new());
         }
+        *self.finished.wait_while(self.running.lock().unwrap(), |n| *n == self.states).unwrap() += 1;
+        let text = self
+            .ctx
+            .create_state()
+            .map_err(|e| format!("Failed to init Whisper: {}", e))
+            .and_then(|mut state| Self::run(&mut state, samples));
+        *self.running.lock().unwrap() -= 1;
+        self.finished.notify_one();
+        text
+    }
+
+    fn run(state: &mut WhisperState, samples: &[f32]) -> Result<String, String> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some("en"));
         params.set_no_context(true); // Each clip is independent.
@@ -52,8 +93,8 @@ impl Transcriber {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
-        self.state.full(params, samples).map_err(|e| format!("Whisper failed: {}", e))?;
-        Ok(self.state.as_iter().map(|seg| seg.to_string()).collect::<Vec<_>>().join(" "))
+        state.full(params, samples).map_err(|e| format!("Whisper failed: {}", e))?;
+        Ok(state.as_iter().map(|seg| seg.to_string()).collect::<Vec<_>>().join(" "))
     }
 }
 
@@ -80,14 +121,14 @@ mod tests {
     // Writes `text` as speech to a temp file with the OS text-to-speech engine.
     #[cfg(target_os = "macos")]
     fn speak(text: &str) -> PathBuf {
-        let aiff = std::env::temp_dir().join(format!("abs-say-{}.aiff", std::process::id()));
+        let aiff = std::env::temp_dir().join(format!("abs-say-{}-{}.aiff", std::process::id(), text.len()));
         assert!(Command::new("say").arg("-o").arg(&aiff).arg(text).status().unwrap().success());
         aiff
     }
 
     #[cfg(windows)]
     fn speak(text: &str) -> PathBuf {
-        let wav = std::env::temp_dir().join(format!("abs-say-{}.wav", std::process::id()));
+        let wav = std::env::temp_dir().join(format!("abs-say-{}-{}.wav", std::process::id(), text.len()));
         let script = format!(
             "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
              $s.SetOutputToWaveFile('{}'); $s.Speak('{}'); $s.Dispose()",
@@ -108,11 +149,44 @@ mod tests {
 
         let samples = clip_samples(&audio, 0.0, 30.0).unwrap();
         assert!(samples.len() > 16000);
-        let mut t = Transcriber::load(&find_model().unwrap()).unwrap();
+        let t = Transcriber::load(&find_model().unwrap()).unwrap();
         let started = std::time::Instant::now();
         let transcript = t.transcribe(&samples).unwrap();
         println!("{:?} in {:?}", transcript, started.elapsed());
         let score = bigram_score(&normalize(&transcript), &normalize(text));
         assert!(score > 0.7, "score {} for {:?}", score, transcript);
+    }
+
+    // Parallel transcription must give the same text, in candidate order, as one clip
+    // at a time. Needs the model and text-to-speech: cargo test -- --ignored
+    #[test]
+    #[ignore]
+    fn parallel_transcripts_match_sequential() {
+        use crate::chapters::{transcribe_candidates, AudioFile, Candidate};
+        let audio = speak(
+            "Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse, \
+             and nothing particular to interest me on shore, I thought I would sail about a little and see the \
+             watery part of the world. It is a way I have of driving off the spleen and regulating the circulation.",
+        );
+        let duration = clip_samples(&audio, 0.0, 600.0).unwrap().len() as f64 / 16000.0;
+        let files = [AudioFile { path: audio.clone(), silences: vec![], duration }];
+        let cands: Vec<Candidate> = [0.0, 0.2, 0.35, 0.5, 0.65, 0.8]
+            .iter()
+            .map(|f| Candidate { file: 0, start: duration * f, end: duration * f + 0.3 })
+            .collect();
+
+        let t = Transcriber::load(&find_model().unwrap()).unwrap();
+        let clip = |from: f64, to: f64| {
+            if to - from < 0.5 { String::new() } else { t.transcribe(&clip_samples(&audio, from, to - from).unwrap()).unwrap() }
+        };
+        let expected: Vec<(String, String)> =
+            cands.iter().map(|c| (clip(0.0, c.start), clip(c.end, duration))).collect();
+
+        let started = std::time::Instant::now();
+        let mut calls = 0;
+        let got = transcribe_candidates(&files, &cands, &t, |_, _| calls += 1).unwrap();
+        println!("{} candidates with {} states in {:?}", cands.len(), t.states(), started.elapsed());
+        assert_eq!(got, expected);
+        assert_eq!(calls, cands.len());
     }
 }

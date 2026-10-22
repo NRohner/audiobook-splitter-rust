@@ -367,8 +367,8 @@ fn match_with_epub(
         s.total = cands.len();
         s.log.push(format!("Transcribing {} candidate breaks with Whisper...", cands.len()));
     }
-    let mut transcriber = Transcriber::load(model)?;
-    let transcripts = transcribe_candidates(files, &cands, &mut transcriber, |done, _| {
+    let transcriber = Transcriber::load(model)?;
+    let transcripts = transcribe_candidates(files, &cands, &transcriber, |done, _| {
         state.lock().unwrap().done = done;
     })?;
 
