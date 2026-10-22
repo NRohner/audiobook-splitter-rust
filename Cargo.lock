@@ -48,6 +48,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "whisper-rs",
+ "whisper-rs-sys",
  "zip 9.0.2",
 ]
 
