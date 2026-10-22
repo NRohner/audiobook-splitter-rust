@@ -2,7 +2,7 @@
 
 ---
 
-A command-line application written in Rust that intelligently splits long audio files (MP3, M4B, WAV, FLAC, AAC, M4A or OGG) into smaller segments. It achieves this by scanning the audio for periods of silence that exceed a user-defined threshold and then splitting the file at the midpoint of these detected silences, preventing abrupt audio clipping.
+A Rust application (local web GUI plus an interactive CLI) that intelligently splits long audio files (MP3, M4B, WAV, FLAC, AAC, M4A or OGG) into smaller segments. It achieves this by scanning the audio for periods of silence that exceed a user-defined threshold and then splitting the file at the midpoint of these detected silences, preventing abrupt audio clipping.
 
 ## Features
 
@@ -24,100 +24,106 @@ A command-line application written in Rust that intelligently splits long audio 
 
 * **Multi-file Processing:** Option to process multiple audio files consecutively.
 
-## Prerequisites
+## Setup
 
-Before running this application, you need to have the following installed on your system:
+You need four things on any platform:
 
-* **Rust:** The Rust programming language and its package manager, Cargo.
+* **Rust** (with Cargo): <https://www.rust-lang.org/tools/install>
+* **CMake** and a **C/C++ compiler**: the Whisper speech-to-text engine (whisper.cpp) is compiled into the app.
+* **FFmpeg and FFprobe** on your `PATH`: the app uses them to analyze and split audio.
+* The **Whisper model** (`models/ggml-base.en.bin`, ~148 MB): downloaded once, see below.
 
-    * Install Rust: Follow the instructions on the official Rust website: <https://www.rust-lang.org/tools/install>
+### macOS
 
-* **FFmpeg and FFprobe:** These are essential multimedia frameworks that the application uses for audio analysis and splitting. They must be installed and accessible in your system's PATH.
+1.  **Install the Xcode command line tools** (C/C++ compiler and `make`):
 
-    ### FFmpeg/FFprobe Installation (Windows Guide)
-
-    1.  **Download Binaries:**
-
-        * Visit <https://www.gyan.dev/ffmpeg/builds/> (recommended source for Windows builds).
-
-        * Under "release builds," download either `ffmpeg-release-essentials.7z` (most common) or `ffmpeg-release-full.7z` (includes more codecs).
-
-    2.  **Extract FFmpeg:**
-
-        * Locate the downloaded `.7z` or `.zip` file.
-
-        * Use a tool like 7-Zip (or Windows' built-in extractor for `.zip`) to extract the contents.
-
-        * **Rename the extracted folder to `FFmpeg`** for simplicity.
-
-    3.  **Move the FFmpeg Folder:**
-
-        * Cut the `FFmpeg` folder and paste it directly into the root of your `C:` drive (e.g., `C:\FFmpeg`).
-
-    4.  **Add to System PATH:**
-
-        * Open the Windows search bar (Windows Key + S), type "environment variables," and select "Edit the system environment variables."
-
-        * In the "System Properties" window, click "Environment Variables...".
-
-        * Under "System variables" (bottom half), find and select the `Path` variable, then click "Edit...".
-
-        * Click "New" and add the path: `C:\FFmpeg\bin`.
-
-        * Click "OK" on all open windows to save the changes.
-
-    5.  **Verify Installation:**
-
-        * Open a **new** Command Prompt or PowerShell window (changes won't apply to existing ones).
-
-        * Type `ffmpeg -version` and press Enter.
-
-        * Type `ffprobe -version` and press Enter.
-
-        * If version information is displayed for both, the installation was successful.
-
-## Installation (Application)
-
-1.  **Clone the Repository (if applicable) or create a new project:**
-
-    ```
-    git clone <repository_url> # If this were a real repo
-    cd audio_splitter
+    ```bash
+    xcode-select --install
     ```
 
-    If you're starting from scratch:
+2.  **Install Rust:**
 
-    ```
-    cargo new audio_splitter
-    cd audio_splitter
-    ```
-
-2.  **Add Dependencies:**
-    Open `Cargo.toml` in your project root and add the `regex` dependency:
-
-    ```toml
-    # Cargo.toml
-    [dependencies]
-    regex = "1"
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
     ```
 
-3.  **Place the Source Code:**
-    Replace the content of `src/main.rs` with the Rust code provided in the `rust-audio-splitter` Canvas.
+3.  **Install CMake and FFmpeg** with [Homebrew](https://brew.sh) (FFprobe ships with FFmpeg):
 
-## Quick Start (GUI)
+    ```bash
+    brew install cmake ffmpeg
+    ```
 
-```bash
-make model   # one-time: download the Whisper model (~148 MB) into models/
-make dev     # debug build, starts the GUI and opens your browser
-make build   # optimized single binary at target/release/audiobook-splitter-rust
-make run     # build + launch the release GUI
-make test    # run the test suite
-make cli     # original interactive terminal flow
-```
+4.  **Clone and run:**
+
+    ```bash
+    git clone https://github.com/NRohner/audiobook-splitter.git
+    cd audiobook-splitter
+    make dev     # downloads the Whisper model on first run, then opens the GUI
+    ```
+
+On Apple Silicon, Whisper runs on the GPU via Metal.
+
+### Windows
+
+1.  **Install Rust:** download and run `rustup-init.exe` from <https://www.rust-lang.org/tools/install>. When asked, let it install the **Visual Studio C++ Build Tools** (the "Desktop development with C++" workload); that is the C/C++ compiler.
+
+2.  **Install CMake and Git:**
+
+    ```powershell
+    winget install Kitware.CMake Git.Git
+    ```
+
+3.  **Install FFmpeg and FFprobe.** The quickest way is winget, which also adds them to your `PATH`:
+
+    ```powershell
+    winget install Gyan.FFmpeg
+    ```
+
+    <details>
+    <summary>Manual install instead</summary>
+
+    1.  Download `ffmpeg-release-essentials.7z` (or `ffmpeg-release-full.7z` for more codecs) from <https://www.gyan.dev/ffmpeg/builds/>.
+    2.  Extract it with 7-Zip, rename the extracted folder to `FFmpeg` and move it to `C:\FFmpeg`.
+    3.  Search the Start menu for "environment variables", open **Edit the system environment variables**, click **Environment Variables...**, select `Path` under **System variables**, click **Edit...**, then **New**, and add `C:\FFmpeg\bin`.
+    4.  Click **OK** on every window.
+
+    </details>
+
+4.  **Check the tools:** open a **new** PowerShell window (`PATH` changes don't reach windows that were already open) and run:
+
+    ```powershell
+    cargo --version
+    cmake --version
+    ffmpeg -version
+    ffprobe -version
+    ```
+
+5.  **Clone, download the model and run.** The Makefile needs `make`, which Windows doesn't include, so run the equivalent commands directly:
+
+    ```powershell
+    git clone https://github.com/NRohner/audiobook-splitter.git
+    cd audiobook-splitter
+    mkdir models
+    curl.exe -L --fail -o models\ggml-base.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+    cargo run    # debug build, opens the GUI
+    ```
+
+    Use `curl.exe`, not `curl`: in Windows PowerShell 5, `curl` is an alias for `Invoke-WebRequest`, which takes different arguments.
+
+## Running
+
+| macOS | Windows (PowerShell) | What it does |
+|---|---|---|
+| `make model` | see step 5 above | One-time: download the Whisper model into `models/` |
+| `make dev` | `cargo run` | Debug build, starts the GUI and opens your browser |
+| `make build` | `cargo build --release` | Optimized single binary at `target/release/audiobook-splitter-rust` (`.exe` on Windows) |
+| `make run` | `cargo run --release` | Build and launch the release GUI |
+| `make test` | `cargo test` | Run the test suite |
+| `make cli` | `cargo run -- --cli` | Original interactive terminal flow |
 
 The GUI is a local web page served by the app itself at `http://127.0.0.1:7878` (it only listens on your machine). Pick an audio file or folder and an output folder (type a path or use the native **File** / **Folder** / **Browse** dialogs), set the detection thresholds, click **Analyze**, tweak and re-analyze until the segment counts look right, then click **Split files**.
 
-The binary is self-contained (the page is compiled in); FFmpeg/FFprobe still need to be on your PATH. Building requires **CMake** (`brew install cmake` on macOS) because the Whisper speech-to-text engine (whisper.cpp) is compiled in; on Apple Silicon it runs on the GPU via Metal. `make dev`/`make run` download the model automatically on first use, or set `WHISPER_MODEL=/path/to/ggml-*.bin` to use a different one (e.g. `ggml-small.en.bin` for higher accuracy).
+The binary is self-contained (the page is compiled in); FFmpeg/FFprobe still need to be on your `PATH`. Set `WHISPER_MODEL=/path/to/ggml-*.bin` to use a different model (e.g. `ggml-small.en.bin` for higher accuracy). In PowerShell: `$env:WHISPER_MODEL = "C:\path\to\ggml-small.en.bin"`.
 
 ### Matching chapters with an EPUB
 
@@ -130,16 +136,17 @@ The binary is self-contained (the page is compiled in); FFmpeg/FFprobe still nee
 ## Usage (CLI)
 
 1.  **Compile and Run the Application:**
-    Navigate to your project's root directory in your terminal or Command Prompt and run:
+    In the project's root directory, run:
 
     ```bash
-    make cli   # or: cargo run -- --cli
+    make cli             # macOS
+    cargo run -- --cli   # Windows
     ```
 
 2.  **Follow the Prompts:**
     The application will guide you through the process:
 
-    * **Audio File Path:** Enter the full path to the audio file you want to split (e.g., `C:\Users\YourName\Music\long_podcast.mp3` or `audio.wav`).
+    * **Audio File Path:** Enter the full path to the audio file you want to split (e.g., `~/Music/long_podcast.mp3` on macOS, `C:\Users\YourName\Music\long_podcast.mp3` on Windows, or `audio.wav`).
 
     * **Minimum Silence Length:** Enter the minimum duration in seconds that a silence must be to be considered a split point (e.g., `0.5`, `2.0`).
 
@@ -160,6 +167,6 @@ The binary is self-contained (the page is compiled in); FFmpeg/FFprobe still nee
 
 * **"No silences detected":** If you're getting this message even with seemingly quiet audio, try adjusting the **noise threshold (n value)**. Experiment with less negative values like `-30.0dB`, `-20.0dB`, or even `-10.0dB`. The optimal value depends on the specific audio's background noise.
 
-* **"FFmpeg/FFprobe not found":** Ensure FFmpeg and FFprobe are correctly installed and their `bin` directory is added to your system's PATH environment variable. Remember to open a *new* terminal window after modifying the PATH.
+* **"FFmpeg/FFprobe not found":** Ensure FFmpeg and FFprobe are correctly installed and their `bin` directory is added to your system's PATH environment variable. On macOS, `brew install ffmpeg` handles this. On Windows, remember to open a *new* terminal window after modifying the PATH.
 
 * **Abrupt Splitting:** The application is designed to split in the middle of silence, but for very short silences or specific audio content, you might still perceive a subtle cut. Adjusting the `silence length threshold` can help.
