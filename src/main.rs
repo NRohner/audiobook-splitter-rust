@@ -1,7 +1,8 @@
 mod gui;
 
-use audiobook_splitter_rust::book::load_chapters;
-use audiobook_splitter_rust::chapters::{candidates, chapter_plan, pick_breaks, transcribe_candidates, AudioFile, SplitJob};
+use audiobook_splitter_rust::book::{book_info, load_chapters};
+use audiobook_splitter_rust::chapters::{candidates, chapter_breaks, pick_breaks, plan_from_breaks, transcribe_candidates, AudioFile, SplitJob};
+use audiobook_splitter_rust::meta::{tracks, Metadata, DEFAULT_TEMPLATE};
 use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
 use audiobook_splitter_rust::{collect_inputs, detect_silences, split_file, split_points};
 use std::io::{self, Write};
@@ -86,10 +87,12 @@ fn process_selection() {
         if path.is_empty() {
             break None;
         }
-        match load_chapters(&PathBuf::from(&path)).and_then(|ch| Ok((ch, find_model()?))) {
-            Ok((chapters, model)) => {
+        let path = PathBuf::from(&path);
+        match load_chapters(&path).and_then(|ch| Ok((ch, book_info(&path)?, find_model()?))) {
+            Ok((chapters, (album, artist, year), model)) => {
                 println!("Status: EPUB has {} chapters.", chapters.len());
-                break Some((chapters, model));
+                let meta = Metadata { album, artist, year, genre: "Audiobook".into(), template: DEFAULT_TEMPLATE.into(), ..Default::default() };
+                break Some((chapters, model, meta));
             }
             Err(e) => println!("Error: {} Please try again.", e),
         }
@@ -132,7 +135,7 @@ fn process_selection() {
                 .map(|f| SplitJob { path: f.path.clone(), points: split_points(&f.silences, min_silence, f.duration), names: None })
                 .filter(|job| !job.points.is_empty())
                 .collect(),
-            Some((chapters, model)) => {
+            Some((chapters, model, _)) => {
                 let cands = candidates(&files, min_silence);
                 println!("\nStatus: Transcribing around {} candidate breaks...", cands.len());
                 let transcripts = Transcriber::load(model).and_then(|mut t| {
@@ -159,7 +162,11 @@ fn process_selection() {
                     println!("  No break found for: {}", names.join(", "));
                 }
                 println!("  Matched {} of {} chapters.", m.breaks.len(), chapters.len());
-                if m.breaks.is_empty() { Vec::new() } else { chapter_plan(&files, &m, chapters) }
+                if m.breaks.is_empty() {
+                    Vec::new()
+                } else {
+                    plan_from_breaks(&files, &chapter_breaks(&m, chapters)).expect("matched breaks are valid")
+                }
             }
         };
 
@@ -181,9 +188,14 @@ fn process_selection() {
         }
     };
 
-    for SplitJob { path, points, names } in &plan {
+    // With an EPUB every part is a numbered, tagged track of the book.
+    let tracks = match &epub {
+        Some((_, _, meta)) => Some(tracks(&plan, meta).expect("default template is valid")),
+        None => None,
+    };
+    for (i, SplitJob { path, points, .. }) in plan.iter().enumerate() {
         println!("\n--- Splitting: {} ---", path.display());
-        let result = split_file(path, &output_dir, points, names.as_deref(), |part, total, out| {
+        let result = split_file(path, &output_dir, points, tracks.as_ref().map(|t| &t[i][..]), |part, total, out| {
             println!("  Status: Writing part {}/{} to '{}'...", part, total, out.display());
         });
         match result {

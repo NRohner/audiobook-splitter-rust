@@ -2,8 +2,11 @@
 // Native file dialogs run in a child process (`--pick`), so this process never becomes
 // a Cocoa app whose unpumped event loop macOS would flag as not responding;
 // analysis and splitting run on a background thread and the page polls /status.
-use audiobook_splitter_rust::book::load_chapters;
-use audiobook_splitter_rust::chapters::{candidates, chapter_plan, pick_breaks, transcribe_candidates, AudioFile, SplitJob};
+use audiobook_splitter_rust::book::{book_info, load_chapters};
+use audiobook_splitter_rust::chapters::{
+    candidates, chapter_breaks, pick_breaks, plan_from_breaks, silence_breaks, transcribe_candidates, AudioFile, Break,
+};
+use audiobook_splitter_rust::meta::{tracks, Metadata, DEFAULT_TEMPLATE};
 use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
 use audiobook_splitter_rust::{collect_inputs, detect_silences, preview_clip, split_file, split_points, AUDIO_EXTENSIONS};
 use serde::{Deserialize, Serialize};
@@ -21,18 +24,31 @@ const CLIP_SECONDS: f64 = 30.0;
 #[derive(Serialize, Clone)]
 struct FileRow {
     name: String,
-    segments: Option<usize>,
     error: Option<String>,
 }
 
+// A chapter start suggested by the analysis; the page edits its own copy.
 #[derive(Serialize)]
 struct BreakRow {
-    file: String,
+    file: usize, // Index into `audio`.
     at: f64,
-    chapter: String,
-    score: f64,
+    title: String,
+    score: Option<f64>, // EPUB match score.
+}
+
+// A silence the page can turn into a chapter break, with what was heard (EPUB only).
+#[derive(Serialize)]
+struct SilenceRow {
+    file: usize,
+    at: f64,
     before: String,
     after: String,
+}
+
+#[derive(Serialize)]
+struct AudioRow {
+    name: String,
+    duration: f64,
 }
 
 #[derive(Serialize, Default)]
@@ -42,14 +58,16 @@ struct Status {
     stage: String,       // What the progress bar is counting right now.
     done: usize,
     total: usize,
-    files: Vec<FileRow>,
-    breaks: Option<Vec<BreakRow>>, // Only when an EPUB was used.
-    missing: Vec<String>,          // EPUB chapters with no matching break.
+    run: usize,          // Counts analyses, so the page knows when to reload its editor.
+    files: Vec<FileRow>, // Every input, with any error.
+    audio: Vec<AudioRow>, // The analyzed files; `file` in breaks and silences indexes these.
+    breaks: Vec<BreakRow>,
+    silences: Vec<SilenceRow>,
+    missing: Vec<String>, // EPUB chapters with no matching break.
+    meta: Metadata,       // Suggested tags.
     log: Vec<String>,
     #[serde(skip)]
-    plan: Vec<SplitJob>, // From the last analysis.
-    #[serde(skip)]
-    break_audio: Vec<(PathBuf, f64)>, // File and split time of each entry in `breaks`.
+    analyzed: Vec<AudioFile>, // Same order as `audio`.
 }
 
 type Shared = Arc<Mutex<Status>>;
@@ -72,6 +90,8 @@ fn default_threshold() -> f64 {
 #[derive(Deserialize)]
 struct SplitReq {
     output: String,
+    breaks: Vec<Break>,
+    meta: Metadata,
 }
 
 #[derive(Deserialize)]
@@ -217,15 +237,17 @@ pub fn pick(kind: &str) {
     }
 }
 
-// `break=N`: CLIP_SECONDS of audio from the middle of break N's silence. Takes an
-// index rather than a path so the page can only play files from the analysis.
+// `file=N&at=T`: CLIP_SECONDS of analyzed file N from T seconds. Takes an index
+// rather than a path so the page can only play files from the analysis.
 fn clip(state: &Shared, query: &str) -> Result<Vec<u8>, String> {
-    let (path, at) = query
-        .strip_prefix("break=")
-        .and_then(|n| n.parse::<usize>().ok())
-        .and_then(|n| state.lock().unwrap().break_audio.get(n).cloned())
-        .ok_or("Unknown chapter break. Analyze again.")?;
-    preview_clip(&path, at, CLIP_SECONDS)
+    let param = |key: &str| query.split('&').find_map(|p| p.strip_prefix(key)?.strip_prefix('='));
+    let file = param("file").and_then(|n| n.parse::<usize>().ok());
+    let at = param("at").and_then(|t| t.parse::<f64>().ok()).filter(|t| *t >= 0.0);
+    let path = file
+        .zip(at)
+        .and_then(|(file, at)| state.lock().unwrap().analyzed.get(file).filter(|f| at < f.duration).map(|f| f.path.clone()))
+        .ok_or("Unknown audio position. Analyze again.")?;
+    preview_clip(&path, at.unwrap(), CLIP_SECONDS)
 }
 
 fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
@@ -247,6 +269,10 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
         "" => None,
         path => Some((load_chapters(&PathBuf::from(path))?, find_model()?)),
     };
+    let mut meta = Metadata { genre: "Audiobook".into(), template: DEFAULT_TEMPLATE.into(), ..Default::default() };
+    if epub.is_some() {
+        (meta.album, meta.artist, meta.year) = book_info(&PathBuf::from(req.epub.trim()))?;
+    }
 
     {
         let mut s = state.lock().unwrap();
@@ -254,11 +280,13 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
             return Err("A job is already running.".into());
         }
         *s = Status {
+            run: s.run + 1,
+            meta,
             running: true,
             phase: "analyze",
             stage: "Detecting silences".into(),
             total: inputs.len(),
-            files: inputs.iter().map(|p| FileRow { name: file_name(p), segments: None, error: None }).collect(),
+            files: inputs.iter().map(|p| FileRow { name: file_name(p), error: None }).collect(),
             ..Default::default()
         };
         s.log.push(format!("Analyzing {} file(s): min silence {}s, noise {}dB", inputs.len(), req.min_silence, req.noise_db));
@@ -277,7 +305,6 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
                 Ok((silences, duration)) => {
                     let count = split_points(&silences, req.min_silence, duration).len();
                     if epub.is_none() {
-                        s.files[i].segments = Some(count);
                         s.log.push(format!("{}: {} segments", file_name(path), count));
                     } else {
                         s.log.push(format!("{}: {} candidate silences", file_name(path), count.saturating_sub(1)));
@@ -293,22 +320,26 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
         }
 
         let result = match &epub {
-            None => Ok(files
-                .iter()
-                .map(|f| SplitJob {
-                    path: f.path.clone(),
-                    points: split_points(&f.silences, req.min_silence, f.duration),
-                    names: None,
-                })
-                .filter(|job| !job.points.is_empty())
-                .collect()),
+            None => Ok((
+                silence_breaks(&files, req.min_silence)
+                    .into_iter()
+                    .map(|b| BreakRow { file: b.file, at: b.at, title: b.title, score: None })
+                    .collect(),
+                candidates(&files, req.min_silence)
+                    .iter()
+                    .map(|c| SilenceRow { file: c.file, at: c.split_at(), before: String::new(), after: String::new() })
+                    .collect(),
+            )),
             Some((chapters, model)) => match_with_epub(&files, chapters, model, &req, &state),
         };
 
         let mut s = state.lock().unwrap();
         match result {
-            Ok(plan) => {
-                s.plan = plan;
+            Ok((breaks, silences)) => {
+                s.breaks = breaks;
+                s.silences = silences;
+                s.audio = files.iter().map(|f| AudioRow { name: file_name(&f.path), duration: f.duration }).collect();
+                s.analyzed = files;
                 s.log.push("Analysis complete.".into());
             }
             Err(e) => s.log.push(format!("Error: {}", e)),
@@ -319,13 +350,14 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
 }
 
 // Transcribes around each candidate silence and matches it to the EPUB's chapters.
+// Returns the suggested chapter breaks and every candidate with what was heard there.
 fn match_with_epub(
     files: &[AudioFile],
     chapters: &[audiobook_splitter_rust::book::Chapter],
     model: &std::path::Path,
     req: &AnalyzeReq,
     state: &Shared,
-) -> Result<Vec<SplitJob>, String> {
+) -> Result<(Vec<BreakRow>, Vec<SilenceRow>), String> {
     let cands = candidates(files, req.min_silence);
     {
         let mut s = state.lock().unwrap();
@@ -340,32 +372,28 @@ fn match_with_epub(
     })?;
 
     let m = pick_breaks(&cands, &transcripts, chapters, req.threshold);
-    let plan = chapter_plan(files, &m, chapters);
-    let title = |ch: usize| chapters[ch].title.clone().unwrap_or_else(|| format!("Section {}", ch + 1));
+    let breaks = chapter_breaks(&m, chapters)
+        .into_iter()
+        .map(|b| {
+            let score = m.breaks.iter().find(|c| c.file == b.file && c.at == b.at).map(|c| c.score);
+            BreakRow { file: b.file, at: b.at, title: b.title, score }
+        })
+        .collect();
+    let silences = cands
+        .iter()
+        .zip(&transcripts)
+        .map(|(c, (before, after))| SilenceRow {
+            file: c.file,
+            at: c.split_at(),
+            before: before.trim().to_string(),
+            after: after.trim().to_string(),
+        })
+        .collect();
 
     let mut s = state.lock().unwrap();
-    for (i, f) in files.iter().enumerate() {
-        if let Some(row) = s.files.iter_mut().find(|r| r.name == file_name(&f.path)) {
-            row.segments = Some(plan[i].points.len());
-        }
-    }
-    s.breaks = Some(
-        m.breaks
-            .iter()
-            .map(|b| BreakRow {
-                file: file_name(&files[b.file].path),
-                at: b.at,
-                chapter: title(b.chapter),
-                score: b.score,
-                before: b.before.clone(),
-                after: b.after.clone(),
-            })
-            .collect(),
-    );
-    s.break_audio = m.breaks.iter().map(|b| (files[b.file].path.clone(), b.at)).collect();
-    s.missing = m.missing.iter().map(|&ch| title(ch)).collect();
+    s.missing = m.missing.iter().map(|&ch| chapters[ch].title.clone().unwrap_or_else(|| format!("Section {}", ch + 1))).collect();
     s.log.push(format!("Matched {} of {} chapters.", m.breaks.len(), chapters.len()));
-    Ok(plan)
+    Ok((breaks, silences))
 }
 
 fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
@@ -377,29 +405,31 @@ fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
         return Err(format!("'{}' is not a folder.", output.display()));
     }
 
-    let plan = {
+    let (plan, tracks) = {
         let mut s = state.lock().unwrap();
         if s.running {
             return Err("A job is already running.".into());
         }
-        if s.phase != "analyze" || s.plan.is_empty() {
-            return Err("Run an analysis that finds segments first.".into());
+        if s.analyzed.is_empty() {
+            return Err("Run an analysis first.".into());
         }
+        let plan = plan_from_breaks(&s.analyzed, &req.breaks)?;
+        let tracks = tracks(&plan, &req.meta)?;
         std::fs::create_dir_all(&output)
             .map_err(|e| format!("Failed to create '{}': {}", output.display(), e))?;
         s.running = true;
         s.phase = "split";
         s.stage = "Writing files".into();
         s.done = 0;
-        s.total = s.plan.iter().map(|job| job.points.len()).sum();
+        s.total = plan.iter().map(|job| job.points.len()).sum();
         s.log.push(format!("Splitting into {}", output.display()));
-        std::mem::take(&mut s.plan)
+        (plan, tracks)
     };
 
     let state = state.clone();
     thread::spawn(move || {
-        for job in &plan {
-            let result = split_file(&job.path, &output, &job.points, job.names.as_deref(), |_, _, out| {
+        for (job, tracks) in plan.iter().zip(&tracks) {
+            let result = split_file(&job.path, &output, &job.points, Some(tracks), |_, _, out| {
                 let mut s = state.lock().unwrap();
                 s.done += 1;
                 s.log.push(format!("Writing {}", file_name(out)));
@@ -427,11 +457,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clip_rejects_unknown_breaks() {
+    fn clip_rejects_unknown_audio() {
         let state: Shared = Arc::default();
-        assert!(clip(&state, "break=0").is_err());
-        assert!(clip(&state, "break=x").is_err());
-        assert!(clip(&state, "").is_err());
+        assert!(clip(&state, "file=0&at=1").is_err());
+        state.lock().unwrap().analyzed.push(AudioFile { path: "a.mp3".into(), silences: vec![], duration: 10.0 });
+        for bad in ["file=1&at=1", "file=0&at=10", "file=0&at=-1", "file=0&at=NaN", "file=x&at=1", "at=1", ""] {
+            assert!(clip(&state, bad).is_err(), "{}", bad);
+        }
     }
 
     #[test]
